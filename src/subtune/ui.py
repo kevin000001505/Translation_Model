@@ -177,6 +177,7 @@ def model_changed(model_label: str, method: str, target: str, custom_id: str):
     return (
         gr.update(visible=model_label == models.CUSTOM_LABEL),
         gr.update(visible=target == models.TARGETS[1], value=models.suggest_gpu(method, spec.params_b if spec else 8)),
+        gr.update(visible=target == models.TARGETS[1]),
         estimate_text(model_label, method, target, custom_id),
         d["learning_rate"], d["lora_r"], d["lora_alpha"], d["batch_size"], d["grad_accum"],
     )
@@ -187,6 +188,9 @@ def estimate_text(model_label: str, method: str, target: str, custom_id: str) ->
     if not spec:
         return "Enter a Hugging Face model id."
     lines = []
+    if model_label == models.CUSTOM_LABEL:
+        ok, msg = models.check_downloadable(spec.model_id)
+        lines.append(("✅ " if ok else "⛔ ") + msg)
     if spec.note:
         lines.append(f"ℹ️ {spec.note}")
     if spec.params_b:
@@ -199,8 +203,11 @@ def estimate_text(model_label: str, method: str, target: str, custom_id: str) ->
             lines.append("QLoRA on ROCm depends on bitsandbytes support for your GPU; it is checked when you start.")
         elif not _qlora_local[0]:
             lines.append(f"⚠️ QLoRA is not available locally ({_qlora_local[1]}). Use LoRA or a Modal GPU.")
-    if target == models.TARGETS[1] and not modal_configured():
-        lines.append("⚠️ MODAL_TOKEN_ID / MODAL_TOKEN_SECRET are not set in `.env`.")
+    if target == models.TARGETS[1]:
+        lines.append("The cloud GPU is billed per second only while the job runs. It is shut down when training "
+                     "ends or fails, when you press Stop, and at the latest after *Max cloud hours*.")
+        if not modal_configured():
+            lines.append("⚠️ MODAL_TOKEN_ID / MODAL_TOKEN_SECRET are not set in `.env`.")
     return "\n\n".join(lines)
 
 
@@ -218,13 +225,13 @@ def _check_qlora_local() -> tuple[bool, str]:
     return _qlora_local
 
 
-def _build_config(src, tgt, selected, members, model_label, custom_id, method, target, gpu, epochs, max_pairs,
-                  lr, lora_r, lora_alpha, batch_size, grad_accum, max_seq_len, eval_sentences) -> TrainConfig:
+def _build_config(src, tgt, selected, members, model_label, custom_id, method, target, gpu, max_hours, epochs,
+                  max_pairs, lr, lora_r, lora_alpha, batch_size, grad_accum, max_seq_len, eval_sentences) -> TrainConfig:
     spec = _spec(model_label, custom_id)
     return TrainConfig(
         model_id=spec.model_id, family=spec.family, src=src, tgt=tgt, method=method,
         target="modal" if target == models.TARGETS[1] else "local", gpu=gpu or "",
-        multimodal=spec.multimodal, trust_remote_code=spec.trust_remote_code,
+        max_hours=float(max_hours or 8), trust_remote_code=spec.trust_remote_code,
         epochs=float(epochs), max_pairs=int(max_pairs or 0), learning_rate=float(lr), lora_r=int(lora_r),
         lora_alpha=int(lora_alpha), batch_size=int(batch_size), grad_accum=int(grad_accum),
         max_seq_len=int(max_seq_len), eval_sentences=int(eval_sentences),
@@ -243,6 +250,10 @@ def start_training(*inputs):
         return ("Select titles on the Data tab first.", *no_choice)
     if not _spec(model_label, custom_id):
         return ("Enter a Hugging Face model id.", *no_choice)
+    if model_label == models.CUSTOM_LABEL:
+        ok, msg = models.check_downloadable(custom_id.strip())
+        if not ok:
+            return (msg, *no_choice)
     if target == models.TARGETS[1] and not modal_configured():
         return ("Set MODAL_TOKEN_ID and MODAL_TOKEN_SECRET in .env first.", *no_choice)
     if target == models.TARGETS[0] and method == "QLoRA":
@@ -378,6 +389,8 @@ def build_ui() -> gr.Blocks:
                 target = gr.Radio(list(models.TARGETS), value=models.TARGETS[0], label="Run on")
                 gpu = gr.Dropdown(list(models.MODAL_GPUS), value=models.suggest_gpu("LoRA", first.params_b),
                                   label="Modal GPU", visible=False)
+                max_hours = gr.Number(value=8, minimum=0.1, maximum=24, label="Max cloud hours (hard stop)",
+                                      visible=False)
             estimate_md = gr.Markdown(estimate_text(first.label, "LoRA", models.TARGETS[0], ""))
             with gr.Row():
                 epochs = gr.Number(value=d["epochs"], label="Epochs", minimum=0.1, step=0.5)
@@ -436,13 +449,14 @@ def build_ui() -> gr.Blocks:
         stop_data.click(lambda: JOBS.stop("data"), None, data_status)
 
         model_inputs = [model_dd, method, target, custom_id]
-        model_outputs = [custom_id, gpu, estimate_md, lr, lora_r, lora_alpha, batch_size, grad_accum]
+        model_outputs = [custom_id, gpu, max_hours, estimate_md, lr, lora_r, lora_alpha, batch_size, grad_accum]
         for comp in (model_dd, method, target):
             comp.change(model_changed, model_inputs, model_outputs)
-        custom_id.change(estimate_text, model_inputs, estimate_md)
+        for event in (custom_id.submit, custom_id.blur):  # checks Hugging Face, so not on every keystroke
+            event(estimate_text, model_inputs, estimate_md)
 
-        train_inputs = [src, tgt, st_selected, st_members, model_dd, custom_id, method, target, gpu, epochs,
-                        max_pairs, lr, lora_r, lora_alpha, batch_size, grad_accum, max_seq_len, eval_sentences]
+        train_inputs = [src, tgt, st_selected, st_members, model_dd, custom_id, method, target, gpu, max_hours,
+                        epochs, max_pairs, lr, lora_r, lora_alpha, batch_size, grad_accum, max_seq_len, eval_sentences]
         start_btn.click(start_training, train_inputs,
                         [train_msg, choice_box, choice_md, train_now_btn, dl_only_btn, dl_train_btn])
         train_now_btn.click(train_ready_now, train_inputs, [train_msg, choice_box])

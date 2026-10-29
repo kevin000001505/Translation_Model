@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import signal
 import sys
 from pathlib import Path
 
@@ -39,6 +40,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--share", action="store_true")
 
     args = parser.parse_args(argv)
+    # The UI's Stop button sends SIGTERM. Exit through Python's normal shutdown instead of dying on
+    # the spot, so `with` blocks run their cleanup (above all: stopping a running Modal app).
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
 
     if args.cmd == "ui":

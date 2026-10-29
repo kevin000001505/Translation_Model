@@ -6,7 +6,7 @@ it will be scored with.
 
 from __future__ import annotations
 
-from .languages import HUNYUAN_CHINESE_NAMES, base_code, iso_code, prompt_name
+from .languages import HUNYUAN_CHINESE_NAMES, base_code, prompt_name
 
 
 def resolve_family(family: str, tokenizer) -> str:
@@ -15,13 +15,21 @@ def resolve_family(family: str, tokenizer) -> str:
     return "chat" if getattr(tokenizer, "chat_template", None) else "plain"
 
 
+def _chinese_prompt(src_lang: str, tgt_lang: str) -> bool:
+    """Tencent's models use a Chinese instruction when either side is Chinese."""
+    return "zh" in (base_code(src_lang), base_code(tgt_lang)) and tgt_lang in HUNYUAN_CHINESE_NAMES
+
+
 def _messages(family: str, src_lang: str, tgt_lang: str, text: str) -> list[dict]:
-    if family == "translategemma":
-        content = [{"type": "text", "source_lang_code": iso_code(src_lang),
-                    "target_lang_code": iso_code(tgt_lang), "text": text}]
-        return [{"role": "user", "content": content}]
+    if family == "hy_mt2":  # wording from the Hy-MT2 model card ("Default Translation")
+        if _chinese_prompt(src_lang, tgt_lang):
+            instruction = f"将以下文本翻译为{HUNYUAN_CHINESE_NAMES[tgt_lang]}，注意只需要输出翻译后的结果，不要额外解释："
+        else:
+            instruction = (f"Translate the following text into {prompt_name(tgt_lang)}. Note that you should only "
+                           "output the translated result without any additional explanation:")
+        return [{"role": "user", "content": f"{instruction}\n\n{text}"}]
     if family == "hunyuan_mt":
-        if "zh" in (base_code(src_lang), base_code(tgt_lang)) and tgt_lang in HUNYUAN_CHINESE_NAMES:
+        if _chinese_prompt(src_lang, tgt_lang):
             instruction = f"把下面的文本翻译成{HUNYUAN_CHINESE_NAMES[tgt_lang]}，不要额外解释。"
         else:
             instruction = f"Translate the following segment into {prompt_name(tgt_lang)}, without additional explanation."

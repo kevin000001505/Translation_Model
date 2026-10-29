@@ -16,7 +16,7 @@ class TrainConfig:
     method: str = "LoRA"  # LoRA | QLoRA | Full
     target: str = "local"  # local | modal
     gpu: str = ""  # Modal GPU type
-    multimodal: bool = False
+    max_hours: float = 8  # Modal hard time limit: the GPU is stopped (and billing ends) by then at the latest
     trust_remote_code: bool = False
     epochs: float = 1
     max_pairs: int = 0  # 0 = all

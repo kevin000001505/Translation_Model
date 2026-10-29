@@ -2,9 +2,9 @@
 
 Comparing different model translation ability and fine tune the model for special language.
 
-**subtune** fine-tunes text-to-text translation models (TranslateGemma, Qwen3, Seed-X, Hunyuan-MT,
-or any Hugging Face chat model) on parallel movie and TV subtitles from OpenSubtitles, through a
-Gradio web app.
+**subtune** fine-tunes text-to-text translation models (Hy-MT2, Hunyuan-MT, Seed-X, Qwen3, or any
+public Hugging Face chat model) on parallel movie and TV subtitles from OpenSubtitles, through a
+Gradio web app. Every model it offers downloads without a token or an access request.
 
 ## What it does
 
@@ -50,7 +50,7 @@ cp .env.example .env
 | `OPENSUBTITLES_USERNAME`, `OPENSUBTITLES_PASSWORD` | Your account; logging in gives the VIP download quota. |
 | `OPENSUBTITLES_USER_AGENT` | Name of your app, e.g. `subtune v0.1`. |
 | `OPENSUBTITLES_RATE_LIMIT` | Requests per second (5 by default; 50 only on a paid API plan). |
-| `HF_TOKEN` | Hugging Face token. TranslateGemma is gated: accept its terms on the model page first. |
+| `HF_TOKEN` | Optional. All offered models are ungated; a token only raises download rate limits. |
 | `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET` | For cloud training (modal.com → Settings → API tokens). |
 
 ## Run
@@ -92,17 +92,38 @@ or download only and continue the next day.
 
 ## Models
 
+All of these are public and ungated on Hugging Face (no token, no access request):
+
 | Model | Notes |
 |---|---|
-| TranslateGemma 4B / 12B / 27B | Gated (Gemma terms). Prompted with its language-code chat template. |
-| Qwen3 4B / 8B / 14B | Apache-2.0. Thinking is turned off in the prompt. |
+| Hy-MT2 7B | Apache-2.0. Tencent's translation model; uses its documented prompts. |
+| Hunyuan-MT 7B | Tencent Hunyuan Community License (check its territory restrictions). |
 | Seed-X PPO 7B | OpenMDW license. Raw prompt ending in a target-language tag. |
-| Hunyuan-MT 7B | Tencent Hunyuan Community License. Uses its documented prompts. |
-| Custom | Any Hugging Face causal LM; uses its chat template if it has one. |
+| Qwen3 4B / 8B / 14B | Apache-2.0. Thinking is turned off in the prompt. |
+| Custom | Any public causal LM. The app checks Hugging Face and refuses gated or private models. |
 
-Training-memory estimates are shown in the app. On the 32 GB R9700, LoRA fits models up to about
-12B, and 27B needs QLoRA or a Modal GPU. QLoRA on ROCm depends on bitsandbytes support for the
+Gated models such as Google's TranslateGemma and Gemma 3 are left out because they require an
+access request.
+
+Training-memory estimates are shown in the app. On the 32 GB R9700, LoRA fits the 4B–8B models;
+Qwen3 14B needs QLoRA or a Modal GPU. QLoRA on ROCm depends on bitsandbytes support for the
 card; the app checks it before starting and suggests Modal if it doesn't work.
+
+## Cloud costs (Modal)
+
+The GPU is billed per second only while a job runs. A job is shut down:
+
+- when training finishes or fails: the job runs as an ephemeral Modal app, which stops as soon as
+  the launcher exits, and the GPU container is released 2 seconds after it returns (Modal's
+  default keeps it idle for up to 60 seconds);
+- when you press **Stop training** (the launcher exits cleanly, which stops the Modal app);
+- if the launcher dies or loses its connection (Modal stops the app when the client disconnects);
+- at the latest after **Max cloud hours** (default 8), a hard limit Modal enforces on its side.
+
+Failed jobs are never retried. After the weights are downloaded, the run's files are deleted from
+the `subtune` Modal volume; the `subtune-hf-cache` volume keeps downloaded base models so the next
+run starts faster (volumes include 1 TiB free). To cap spending on top of this, set a budget in
+the Modal dashboard.
 
 ## Layout
 

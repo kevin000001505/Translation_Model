@@ -2,7 +2,16 @@
 
 The run's dataset is uploaded to the ``subtune`` Modal volume, training runs in a container with
 the chosen GPU, and the finished weights are downloaded back into ``outputs/models/<tag>``.
-Needs MODAL_TOKEN_ID / MODAL_TOKEN_SECRET (and HF_TOKEN for gated models) in .env.
+Needs MODAL_TOKEN_ID / MODAL_TOKEN_SECRET in .env.
+
+Billing stops when the job ends. The job runs in an *ephemeral* app (``app.run()``), which Modal
+stops as soon as this script exits, fails, or loses its connection. On top of that:
+
+- ``scaledown_window=2`` releases the GPU container 2 s after the function returns (Modal's
+  default keeps an idle container, and bills it, for up to 60 s);
+- ``timeout`` (the run's ``max_hours``) is a hard cap: Modal kills the container at that point
+  even if the local script is gone;
+- ``retries`` is left at 0, so a crash never starts a second paid attempt.
 """
 
 from __future__ import annotations
@@ -24,7 +33,7 @@ image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install(
         "torch==2.8.0",
-        "transformers>=4.56",
+        "transformers>=5.6",
         "peft>=0.13",
         "accelerate>=1.0",
         "bitsandbytes>=0.45",
@@ -42,7 +51,8 @@ image = (
 @app.function(
     image=image,
     gpu="L40S",
-    timeout=24 * 3600,
+    timeout=8 * 3600,  # replaced per run with the run's max_hours
+    scaledown_window=2,  # the minimum Modal allows: free the GPU right after the job returns
     volumes={VOLUME_ROOT: volume, "/hf-cache": hf_cache},
     secrets=[modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN") or ""})],
 )
@@ -63,9 +73,15 @@ def run_on_modal(cfg, run_dir: Path, tag: str, out_dir: Path, log: Callable[[str
     with volume.batch_upload(force=True) as batch:
         for name in ("train.jsonl", "eval.jsonl"):
             batch.put_file(str(run_dir / name), f"/runs/{run_name}/{name}")
-    log(f"Starting Modal job on {cfg.gpu}. Container logs follow.")
-    with modal.enable_output(), app.run():
-        metrics = train_remote.with_options(gpu=cfg.gpu).remote(cfg.to_dict(), run_name, tag)
+    timeout = max(60, min(int(cfg.max_hours * 3600), 24 * 3600))  # Modal allows up to 24 h
+    log(f"Starting Modal job on {cfg.gpu}, hard time limit {timeout / 3600:.1f} h. Container logs follow.")
+    try:
+        with modal.enable_output(), app.run():
+            metrics = train_remote.with_options(gpu=cfg.gpu, timeout=timeout).remote(cfg.to_dict(), run_name, tag)
+    finally:
+        # Leaving app.run() stops the ephemeral app and every container in it, also on errors and on
+        # Stop (SIGTERM is turned into SystemExit by the CLI), so no GPU keeps running.
+        log("Modal app stopped; the cloud GPU is released.")
     log("Downloading weights from Modal.")
     remote_root = f"models/{tag}"
     for entry in volume.listdir(remote_root, recursive=True):
@@ -77,5 +93,9 @@ def run_on_modal(cfg, run_dir: Path, tag: str, out_dir: Path, log: Callable[[str
         with dest.open("wb") as f:
             for chunk in volume.read_file(entry.path):
                 f.write(chunk)
-    log(f"Weights saved to {out_dir} (also kept in the Modal volume at {remote_root}).")
+    # The local copy is now the one that counts: remove this run from the volume. The Hugging Face
+    # cache volume is kept so the next run does not download the base model again.
+    for path in (remote_root, f"runs/{run_name}"):
+        volume.remove_file(path, recursive=True)
+    log(f"Weights saved to {out_dir}; run files removed from the Modal volume.")
     return metrics

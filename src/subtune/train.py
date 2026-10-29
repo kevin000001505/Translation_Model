@@ -57,12 +57,7 @@ def load_model(cfg: TrainConfig, log: Log):
             load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
             bnb_4bit_compute_dtype=torch.bfloat16,
         )
-    if cfg.multimodal:
-        from transformers import AutoModelForImageTextToText
-
-        model = AutoModelForImageTextToText.from_pretrained(cfg.model_id, **kwargs)
-    else:
-        model = AutoModelForCausalLM.from_pretrained(cfg.model_id, **kwargs)
+    model = AutoModelForCausalLM.from_pretrained(cfg.model_id, **kwargs)
     if tokenizer.eos_token is None:
         # Some tokenizers (e.g. Seed-X) only declare EOS in the model config; without it the model
         # would never learn where a translation ends.
@@ -77,8 +72,8 @@ def load_model(cfg: TrainConfig, log: Log):
     return model, tokenizer
 
 
-# Attention and MLP projections of the language model; the regex skips any vision tower.
-LORA_TARGETS = r"^(?!.*(vision|visual|multi_modal_projector)).*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$"
+# Attention and MLP projections (the usual LoRA targets for Llama/Qwen/Mistral-style models).
+LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 
 def add_adapters(model, cfg: TrainConfig, log: Log):
@@ -116,7 +111,7 @@ class _Examples(torch.utils.data.Dataset):
         return self.items[i]
 
 
-def _collate(pad_id: int, token_types: bool = False):
+def _collate(pad_id: int):
     def collate(batch):
         n = max(len(ids) for ids, _ in batch)
         ids = torch.full((len(batch), n), pad_id, dtype=torch.long)
@@ -126,10 +121,7 @@ def _collate(pad_id: int, token_types: bool = False):
             ids[i, : len(x)] = torch.tensor(x)
             labels[i, : len(y)] = torch.tensor(y)
             mask[i, : len(x)] = 1
-        out = {"input_ids": ids, "attention_mask": mask, "labels": labels}
-        if token_types:  # Gemma 3 multimodal models expect token types (all text here) when training
-            out["token_type_ids"] = torch.zeros_like(ids)
-        return out
+        return {"input_ids": ids, "attention_mask": mask, "labels": labels}
 
     return collate
 
@@ -221,7 +213,7 @@ def run_training(cfg: TrainConfig, run_dir: Path, out_dir: Path, log: Log = prin
         disable_tqdm=True,  # the log callback reports progress; tqdm bars clutter the job log
     )
     trainer = Trainer(model=model, args=args, train_dataset=data,
-                      data_collator=_collate(tokenizer.pad_token_id, cfg.multimodal),
+                      data_collator=_collate(tokenizer.pad_token_id),
                       callbacks=[_LogCallback()])
     t0 = time.time()
     result = trainer.train()

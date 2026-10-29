@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# Every curated model is ungated on Hugging Face: it downloads without a token or an access request.
+#
 # Prompt families (see prompts.py):
-#   translategemma  structured chat content with source/target language codes
 #   hunyuan_mt      chat template, Hunyuan-MT's own instruction wording
+#   hy_mt2          chat template, Hy-MT2's own instruction wording
 #   seedx           raw prompt ending in a target-language tag, no chat template
 #   chat            any chat model: generic instruction through its chat template
 #   plain           base model without a chat template: "Source: ...\nTranslation:"
@@ -18,25 +20,19 @@ class ModelSpec:
     label: str
     family: str
     params_b: float
-    multimodal: bool = False  # loads with AutoModelForImageTextToText
     trust_remote_code: bool = False
     note: str = ""
 
 
 MODELS: list[ModelSpec] = [
-    ModelSpec("google/translategemma-4b-it", "TranslateGemma 4B", "translategemma", 4.3, multimodal=True,
-              note="Gated: accept the Gemma terms on Hugging Face first."),
-    ModelSpec("google/translategemma-12b-it", "TranslateGemma 12B", "translategemma", 12.2, multimodal=True,
-              note="Gated: accept the Gemma terms on Hugging Face first."),
-    ModelSpec("google/translategemma-27b-it", "TranslateGemma 27B", "translategemma", 27.4, multimodal=True,
-              note="Gated: accept the Gemma terms on Hugging Face first."),
+    ModelSpec("tencent/Hy-MT2-7B", "Hy-MT2 7B", "hy_mt2", 7.5, note="Apache-2.0. Needs transformers 5.6 or newer."),
+    ModelSpec("tencent/Hunyuan-MT-7B", "Hunyuan-MT 7B", "hunyuan_mt", 7.5,
+              note="Tencent Hunyuan Community License (check its territory restrictions)."),
+    ModelSpec("ByteDance-Seed/Seed-X-PPO-7B", "Seed-X PPO 7B", "seedx", 7.5,
+              note="OpenMDW license. No chat template; prompts end with a target-language tag."),
     ModelSpec("Qwen/Qwen3-4B", "Qwen3 4B", "chat", 4.0),
     ModelSpec("Qwen/Qwen3-8B", "Qwen3 8B", "chat", 8.2),
     ModelSpec("Qwen/Qwen3-14B", "Qwen3 14B", "chat", 14.8),
-    ModelSpec("ByteDance-Seed/Seed-X-PPO-7B", "Seed-X PPO 7B", "seedx", 7.5,
-              note="No chat template; prompts end with a target-language tag."),
-    ModelSpec("tencent/Hunyuan-MT-7B", "Hunyuan-MT 7B", "hunyuan_mt", 7.5,
-              note="Tencent Hunyuan Community License (check its territory restrictions)."),
 ]
 
 CUSTOM_LABEL = "Custom Hugging Face model…"
@@ -52,6 +48,26 @@ def by_label(label: str) -> ModelSpec | None:
 
 def by_id(model_id: str) -> ModelSpec | None:
     return next((m for m in MODELS if m.model_id == model_id), None)
+
+
+def check_downloadable(model_id: str) -> tuple[bool, str]:
+    """A model is allowed only if anyone can download it: public and not gated on Hugging Face."""
+    from huggingface_hub import model_info
+    from huggingface_hub.errors import GatedRepoError, RepositoryNotFoundError
+
+    if "/" not in model_id:
+        return False, f"'{model_id}' is not a Hugging Face model id (expected org/name)."
+    try:
+        info = model_info(model_id, token=False)
+    except GatedRepoError:
+        return False, f"{model_id} is gated (needs an access request); pick an ungated model."
+    except RepositoryNotFoundError:
+        return False, f"{model_id} does not exist or is private."
+    except Exception as exc:  # network errors
+        return False, f"Could not check {model_id} on Hugging Face: {exc}"
+    if info.gated:
+        return False, f"{model_id} is gated (needs an access request); pick an ungated model."
+    return True, f"{model_id} is public and ungated."
 
 
 def custom_spec(model_id: str) -> ModelSpec:
