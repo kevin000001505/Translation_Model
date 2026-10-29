@@ -5,8 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 # Every curated model is ungated on Hugging Face: it downloads without a token or an access request.
+# GGUF models (llama.cpp format) are converted once to a regular checkpoint before training (gguf.py).
 #
 # Prompt families (see prompts.py):
+#   translategemma  TranslateGemma's chat template: structured content with language codes
 #   hunyuan_mt      chat template, Hunyuan-MT's own instruction wording
 #   hy_mt2          chat template, Hy-MT2's own instruction wording
 #   seedx           raw prompt ending in a target-language tag, no chat template
@@ -22,9 +24,19 @@ class ModelSpec:
     params_b: float
     trust_remote_code: bool = False
     note: str = ""
+    gguf_file: str = ""  # set for GGUF repos: which .gguf file in the repo to use
 
+
+_GEMMA_NOTE = ("Ungated GGUF copy by mradermacher; Google's original repo is gated. The Gemma Terms of Use "
+               "still apply to the fine-tuned model. Converting the GGUF needs about {ram} GB of RAM once.")
 
 MODELS: list[ModelSpec] = [
+    ModelSpec("mradermacher/translategemma-4b-it-GGUF", "TranslateGemma 4B (GGUF f16)", "translategemma", 3.9,
+              gguf_file="translategemma-4b-it.f16.gguf", note=_GEMMA_NOTE.format(ram=16)),
+    ModelSpec("mradermacher/translategemma-12b-it-GGUF", "TranslateGemma 12B (GGUF Q8_0)", "translategemma", 11.8,
+              gguf_file="translategemma-12b-it.Q8_0.gguf", note=_GEMMA_NOTE.format(ram=40)),
+    ModelSpec("mradermacher/translategemma-27b-it-GGUF", "TranslateGemma 27B (GGUF Q8_0)", "translategemma", 27.0,
+              gguf_file="translategemma-27b-it.Q8_0.gguf", note=_GEMMA_NOTE.format(ram=80)),
     ModelSpec("tencent/Hy-MT2-7B", "Hy-MT2 7B", "hy_mt2", 7.5, note="Apache-2.0. Needs transformers 5.6 or newer."),
     ModelSpec("tencent/Hunyuan-MT-7B", "Hunyuan-MT 7B", "hunyuan_mt", 7.5,
               note="Tencent Hunyuan Community License (check its territory restrictions)."),
@@ -70,9 +82,20 @@ def check_downloadable(model_id: str) -> tuple[bool, str]:
     return True, f"{model_id} is public and ungated."
 
 
-def custom_spec(model_id: str) -> ModelSpec:
-    # family "auto" resolves to chat or plain once the tokenizer is loaded.
-    return ModelSpec(model_id, model_id, "auto", 0.0)
+def gguf_files(model_id: str) -> list[str]:
+    """Model .gguf files in a repo (vision projector files left out); [] for a regular repo."""
+    from huggingface_hub import list_repo_files
+
+    try:
+        files = list_repo_files(model_id, token=False)
+    except Exception:
+        return []
+    return sorted(f for f in files if f.endswith(".gguf") and "mmproj" not in f.lower())
+
+
+def custom_spec(model_id: str, gguf_file: str = "") -> ModelSpec:
+    # family "auto" resolves to translategemma, chat or plain once the tokenizer is loaded.
+    return ModelSpec(model_id, model_id, "auto", 0.0, gguf_file=gguf_file)
 
 
 def defaults(method: str, params_b: float) -> dict:

@@ -23,6 +23,7 @@ train = [
     "accelerate>=1.0",
     "sentencepiece",
     "protobuf",
+    "gguf",  # read GGUF models (converted to a regular checkpoint before training)
 ]
 qlora = ["bitsandbytes>=0.45"]
 cloud = ["modal>=1.0"]

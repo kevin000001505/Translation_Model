@@ -7,8 +7,7 @@ Needs MODAL_TOKEN_ID / MODAL_TOKEN_SECRET in .env.
 Billing stops when the job ends. The job runs in an *ephemeral* app (``app.run()``), which Modal
 stops as soon as this script exits, fails, or loses its connection. On top of that:
 
-- ``scaledown_window=2`` releases the GPU container 2 s after the function returns (Modal's
-  default keeps an idle container, and bills it, for up to 60 s);
+- an idle container is released after Modal's default ``scaledown_window`` (60 s);
 - ``timeout`` (the run's ``max_hours``) is a hard cap: Modal kills the container at that point
   even if the local script is gone;
 - ``retries`` is left at 0, so a crash never starts a second paid attempt.
@@ -40,10 +39,12 @@ image = (
         "sacrebleu>=2.4",
         "sentencepiece",
         "protobuf",
+        "gguf",
         "python-dotenv",
         "numpy",
     )
-    .env({"HF_HOME": "/hf-cache", "HF_HUB_ENABLE_HF_TRANSFER": "0"})
+    # Converted GGUF models live on the cache volume, so a GGUF is converted only once.
+    .env({"HF_HOME": "/hf-cache", "HF_HUB_ENABLE_HF_TRANSFER": "0", "SUBTUNE_GGUF_CACHE": "/hf-cache/gguf-converted"})
     .add_local_python_source("subtune")
 )
 
@@ -52,7 +53,6 @@ image = (
     image=image,
     gpu="L40S",
     timeout=8 * 3600,  # replaced per run with the run's max_hours
-    scaledown_window=2,  # the minimum Modal allows: free the GPU right after the job returns
     volumes={VOLUME_ROOT: volume, "/hf-cache": hf_cache},
     secrets=[modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN") or ""})],
 )
@@ -64,7 +64,20 @@ def train_remote(cfg_dict: dict, run_name: str, tag: str) -> dict:
     out_dir = Path(VOLUME_ROOT) / "models" / tag
     metrics = run_training(TrainConfig.from_dict(cfg_dict), run_dir, out_dir, lambda m: print(m, flush=True))
     volume.commit()
+    hf_cache.commit()
     return metrics
+
+
+def _memory_mib(cfg) -> int | None:
+    """RAM to reserve for GGUF runs, whose one-time conversion holds the whole bf16 model in memory.
+    Other runs keep Modal's default (memory is billed by the amount reserved)."""
+    if not cfg.gguf_file:
+        return None
+    from .models import by_id
+
+    spec = by_id(cfg.model_id)
+    params_b = spec.params_b if spec else 14
+    return int((params_b * 3 + 8) * 1024)
 
 
 def run_on_modal(cfg, run_dir: Path, tag: str, out_dir: Path, log: Callable[[str], None]) -> dict:
@@ -77,7 +90,8 @@ def run_on_modal(cfg, run_dir: Path, tag: str, out_dir: Path, log: Callable[[str
     log(f"Starting Modal job on {cfg.gpu}, hard time limit {timeout / 3600:.1f} h. Container logs follow.")
     try:
         with modal.enable_output(), app.run():
-            metrics = train_remote.with_options(gpu=cfg.gpu, timeout=timeout).remote(cfg.to_dict(), run_name, tag)
+            fn = train_remote.with_options(gpu=cfg.gpu, timeout=timeout, memory=_memory_mib(cfg))
+            metrics = fn.remote(cfg.to_dict(), run_name, tag)
     finally:
         # Leaving app.run() stops the ephemeral app and every container in it, also on errors and on
         # Stop (SIGTERM is turned into SystemExit by the CLI), so no GPU keeps running.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -165,32 +166,51 @@ def poll_data(was_running: bool, src: str, tgt: str, selected, kind, search):
 
 # --- train tab ------------------------------------------------------------------------------
 
-def _spec(model_label: str, custom_id: str) -> models.ModelSpec | None:
+def _spec(model_label: str, custom_id: str, gguf_file: str = "") -> models.ModelSpec | None:
     if model_label == models.CUSTOM_LABEL:
-        return models.custom_spec(custom_id.strip()) if custom_id and custom_id.strip() else None
+        if not custom_id or not custom_id.strip():
+            return None
+        return models.custom_spec(custom_id.strip(), gguf_file or "")
     return models.by_label(model_label)
 
 
-def model_changed(model_label: str, method: str, target: str, custom_id: str):
-    spec = _spec(model_label, custom_id)
+def model_changed(model_label: str, method: str, target: str, custom_id: str, gguf_file: str):
+    spec = _spec(model_label, custom_id, gguf_file)
     d = models.defaults(method, spec.params_b if spec else 0)
+    custom = model_label == models.CUSTOM_LABEL
     return (
-        gr.update(visible=model_label == models.CUSTOM_LABEL),
+        gr.update(visible=custom),
+        gr.update(visible=custom and bool(gguf_file)),
         gr.update(visible=target == models.TARGETS[1], value=models.suggest_gpu(method, spec.params_b if spec else 8)),
         gr.update(visible=target == models.TARGETS[1]),
-        estimate_text(model_label, method, target, custom_id),
+        estimate_text(model_label, method, target, custom_id, gguf_file),
         d["learning_rate"], d["lora_r"], d["lora_alpha"], d["batch_size"], d["grad_accum"],
     )
 
 
-def estimate_text(model_label: str, method: str, target: str, custom_id: str) -> str:
-    spec = _spec(model_label, custom_id)
+def custom_repo_changed(model_label: str, method: str, target: str, custom_id: str):
+    """List the repo's GGUF files (if it is a GGUF repo) and re-check it."""
+    files = models.gguf_files(custom_id.strip()) if custom_id and custom_id.strip() else []
+    choice = files[0] if files else ""
+    preferred = [f for f in files if re.search(r"(bf16|f16|f32|q8_0)", f, re.I)]
+    if preferred:
+        choice = preferred[0]  # fine-tune from the most precise file available
+    return (gr.update(choices=files, value=choice or None, visible=bool(files)),
+            estimate_text(model_label, method, target, custom_id, choice))
+
+
+def estimate_text(model_label: str, method: str, target: str, custom_id: str, gguf_file: str = "") -> str:
+    spec = _spec(model_label, custom_id, gguf_file)
     if not spec:
         return "Enter a Hugging Face model id."
     lines = []
     if model_label == models.CUSTOM_LABEL:
         ok, msg = models.check_downloadable(spec.model_id)
         lines.append(("✅ " if ok else "⛔ ") + msg)
+        if spec.gguf_file:
+            lines.append(f"GGUF file `{spec.gguf_file}` is converted to a regular checkpoint once before training "
+                         "(needs RAM for the full model). Prefer f16/bf16/Q8_0 files: lower-bit quantization "
+                         "errors carry into the fine-tune.")
     if spec.note:
         lines.append(f"ℹ️ {spec.note}")
     if spec.params_b:
@@ -204,8 +224,9 @@ def estimate_text(model_label: str, method: str, target: str, custom_id: str) ->
         elif not _qlora_local[0]:
             lines.append(f"⚠️ QLoRA is not available locally ({_qlora_local[1]}). Use LoRA or a Modal GPU.")
     if target == models.TARGETS[1]:
-        lines.append("The cloud GPU is billed per second only while the job runs. It is shut down when training "
-                     "ends or fails, when you press Stop, and at the latest after *Max cloud hours*.")
+        lines.append("The cloud GPU is billed per second while the job runs, plus Modal's 60 s idle window. It is "
+                     "shut down when training ends or fails, when you press Stop, and at the latest after "
+                     "*Max cloud hours*.")
         if not modal_configured():
             lines.append("⚠️ MODAL_TOKEN_ID / MODAL_TOKEN_SECRET are not set in `.env`.")
     return "\n\n".join(lines)
@@ -225,11 +246,12 @@ def _check_qlora_local() -> tuple[bool, str]:
     return _qlora_local
 
 
-def _build_config(src, tgt, selected, members, model_label, custom_id, method, target, gpu, max_hours, epochs,
-                  max_pairs, lr, lora_r, lora_alpha, batch_size, grad_accum, max_seq_len, eval_sentences) -> TrainConfig:
-    spec = _spec(model_label, custom_id)
+def _build_config(src, tgt, selected, members, model_label, custom_id, gguf_file, method, target, gpu, max_hours,
+                  epochs, max_pairs, lr, lora_r, lora_alpha, batch_size, grad_accum, max_seq_len,
+                  eval_sentences) -> TrainConfig:
+    spec = _spec(model_label, custom_id, gguf_file)
     return TrainConfig(
-        model_id=spec.model_id, family=spec.family, src=src, tgt=tgt, method=method,
+        model_id=spec.model_id, family=spec.family, gguf_file=spec.gguf_file, src=src, tgt=tgt, method=method,
         target="modal" if target == models.TARGETS[1] else "local", gpu=gpu or "",
         max_hours=float(max_hours or 8), trust_remote_code=spec.trust_remote_code,
         epochs=float(epochs), max_pairs=int(max_pairs or 0), learning_rate=float(lr), lora_r=int(lora_r),
@@ -244,11 +266,11 @@ HIDE = gr.update(visible=False)
 
 def start_training(*inputs):
     """Check everything; start right away if all data is ready, else ask what to do."""
-    src, tgt, selected, members, model_label, custom_id, method, target = inputs[:8]
+    src, tgt, selected, members, model_label, custom_id, gguf_file, method, target = inputs[:9]
     no_choice = (HIDE, "", HIDE, HIDE, HIDE)
     if not selected:
         return ("Select titles on the Data tab first.", *no_choice)
-    if not _spec(model_label, custom_id):
+    if not _spec(model_label, custom_id, gguf_file):
         return ("Enter a Hugging Face model id.", *no_choice)
     if model_label == models.CUSTOM_LABEL:
         ok, msg = models.check_downloadable(custom_id.strip())
@@ -383,7 +405,8 @@ def build_ui() -> gr.Blocks:
             with gr.Row():
                 model_dd = gr.Dropdown(model_choices, value=first.label, label="Base model")
                 custom_id = gr.Textbox(label="Hugging Face model id", visible=False,
-                                       placeholder="org/model (a chat or base causal LM)")
+                                       placeholder="org/model, or a GGUF repo such as org/model-GGUF")
+                gguf_dd = gr.Dropdown([], label="GGUF file", visible=False)
             with gr.Row():
                 method = gr.Radio(list(models.METHODS), value="LoRA", label="Method")
                 target = gr.Radio(list(models.TARGETS), value=models.TARGETS[0], label="Run on")
@@ -448,14 +471,16 @@ def build_ui() -> gr.Blocks:
         dl_btn.click(start_download, [src, tgt, st_selected, st_members], data_status)
         stop_data.click(lambda: JOBS.stop("data"), None, data_status)
 
-        model_inputs = [model_dd, method, target, custom_id]
-        model_outputs = [custom_id, gpu, max_hours, estimate_md, lr, lora_r, lora_alpha, batch_size, grad_accum]
+        model_inputs = [model_dd, method, target, custom_id, gguf_dd]
+        model_outputs = [custom_id, gguf_dd, gpu, max_hours, estimate_md, lr, lora_r, lora_alpha, batch_size,
+                         grad_accum]
         for comp in (model_dd, method, target):
             comp.change(model_changed, model_inputs, model_outputs)
         for event in (custom_id.submit, custom_id.blur):  # checks Hugging Face, so not on every keystroke
-            event(estimate_text, model_inputs, estimate_md)
+            event(custom_repo_changed, model_inputs[:4], [gguf_dd, estimate_md])
+        gguf_dd.input(estimate_text, model_inputs, estimate_md)
 
-        train_inputs = [src, tgt, st_selected, st_members, model_dd, custom_id, method, target, gpu, max_hours,
+        train_inputs = [src, tgt, st_selected, st_members, model_dd, custom_id, gguf_dd, method, target, gpu, max_hours,
                         epochs, max_pairs, lr, lora_r, lora_alpha, batch_size, grad_accum, max_seq_len, eval_sentences]
         start_btn.click(start_training, train_inputs,
                         [train_msg, choice_box, choice_md, train_now_btn, dl_only_btn, dl_train_btn])

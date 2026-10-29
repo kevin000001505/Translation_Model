@@ -2,9 +2,36 @@
 
 Comparing different model translation ability and fine tune the model for special language.
 
-**subtune** fine-tunes text-to-text translation models (Hy-MT2, Hunyuan-MT, Seed-X, Qwen3, or any
-public Hugging Face chat model) on parallel movie and TV subtitles from OpenSubtitles, through a
-Gradio web app. Every model it offers downloads without a token or an access request.
+**subtune** fine-tunes text-to-text translation models (TranslateGemma via GGUF, Hy-MT2, Hunyuan-MT,
+Seed-X, Qwen3, or any public Hugging Face chat model or GGUF) on parallel movie and TV subtitles from
+OpenSubtitles, through a Gradio web app. Every model it offers downloads without a token or an
+access request.
+
+## Quick start (Docker)
+
+```bash
+cp .env.example .env
+```
+
+Fill in `.env`, then:
+
+```bash
+docker compose up -d --build
+```
+
+Open http://localhost:7860. Downloaded subtitles, the catalog and converted GGUF models are kept in
+`./data`, fine-tuned models in `./outputs`, and Hugging Face downloads in the `hf-cache` volume.
+
+The image uses PyTorch for ROCm 7.2 and passes the AMD GPU (`/dev/kfd`, `/dev/dri`) into the
+container; the host needs the `amdgpu` kernel driver. To use another PyTorch build, set
+`TORCH_INDEX_URL` (for example `https://download.pytorch.org/whl/rocm7.1`) in `.env` before
+building. On a machine without an AMD GPU (training on Modal only):
+
+```bash
+TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu docker compose -f docker-compose.yml -f docker-compose.no-gpu.yml up -d --build
+```
+
+Files the container writes to `./data` and `./outputs` are owned by root.
 
 ## What it does
 
@@ -19,7 +46,7 @@ Gradio web app. Every model it offers downloads without a token or an access req
 4. **Tag:** the result is saved as `outputs/models/<model>__<src>-<tgt>__<method>__<date>/` with a
    `metadata.json` and a model card. The Models tab lists every tag with its scores.
 
-## Setup
+## Setup without Docker
 
 ```bash
 uv venv && source .venv/bin/activate
@@ -96,26 +123,39 @@ All of these are public and ungated on Hugging Face (no token, no access request
 
 | Model | Notes |
 |---|---|
+| TranslateGemma 4B / 12B / 27B (GGUF) | Ungated GGUF copies by mradermacher (f16 for 4B, Q8_0 for 12B/27B). Gemma Terms of Use apply. |
 | Hy-MT2 7B | Apache-2.0. Tencent's translation model; uses its documented prompts. |
 | Hunyuan-MT 7B | Tencent Hunyuan Community License (check its territory restrictions). |
 | Seed-X PPO 7B | OpenMDW license. Raw prompt ending in a target-language tag. |
 | Qwen3 4B / 8B / 14B | Apache-2.0. Thinking is turned off in the prompt. |
-| Custom | Any public causal LM. The app checks Hugging Face and refuses gated or private models. |
+| Custom | Any public causal LM or GGUF repo. The app checks Hugging Face and refuses gated or private models. |
 
-Gated models such as Google's TranslateGemma and Gemma 3 are left out because they require an
-access request.
+Google's own TranslateGemma repos are gated (they require an access request), so the app uses
+community GGUF copies of the same weights, which download freely.
 
-Training-memory estimates are shown in the app. On the 32 GB R9700, LoRA fits the 4B–8B models;
-Qwen3 14B needs QLoRA or a Modal GPU. QLoRA on ROCm depends on bitsandbytes support for the
+### GGUF models
+
+GGUF is the llama.cpp file format. Transformers can't train a quantized GGUF directly, so on first
+use the app converts the chosen file into a regular bf16 checkpoint (cached in
+`data/gguf-converted/`, or on the Modal cache volume) and trains from that. The conversion needs
+RAM for the whole model: about 16 GB for 4B, 40 GB for 12B and 80 GB for 27B. On Modal the app
+reserves that RAM for GGUF runs.
+
+For a custom GGUF repo, enter its id (for example `bullerwins/translategemma-4b-it-GGUF`) and pick a
+file. Prefer f16, bf16 or Q8_0 files: lower-bit quantization errors carry into the fine-tune.
+Transformers reads GGUF for the common architectures (Llama, Mistral, Qwen2/3, Gemma 2/3 and
+others); Hunyuan GGUFs are not supported, so use the regular Hy-MT2 and Hunyuan-MT repos.
+
+Training-memory estimates are shown in the app. On the 32 GB R9700, LoRA fits the 4B–12B models;
+Qwen3 14B and TranslateGemma 27B need QLoRA or a Modal GPU. QLoRA on ROCm depends on bitsandbytes support for the
 card; the app checks it before starting and suggests Modal if it doesn't work.
 
 ## Cloud costs (Modal)
 
-The GPU is billed per second only while a job runs. A job is shut down:
+The GPU is billed per second while a job runs. A job is shut down:
 
 - when training finishes or fails: the job runs as an ephemeral Modal app, which stops as soon as
-  the launcher exits, and the GPU container is released 2 seconds after it returns (Modal's
-  default keeps it idle for up to 60 seconds);
+  the launcher exits; an idle container is released after Modal's default 60-second window;
 - when you press **Stop training** (the launcher exits cleanly, which stops the Modal app);
 - if the launcher dies or loses its connection (Modal stops the app when the client disconnects);
 - at the latest after **Max cloud hours** (default 8), a hard limit Modal enforces on its side.
@@ -132,6 +172,7 @@ data/catalog.sqlite      what OpenSubtitles has, what is downloaded and aligned
 data/subtitles/<lang>/   downloaded .srt files, one per OpenSubtitles file id
 data/pairs/<src>__<tgt>/ aligned sentence pairs per movie/episode (JSONL)
 data/runs/               per-run datasets, configs and checkpoints
+data/gguf-converted/     GGUF models converted to bf16 checkpoints (reused across runs)
 data/logs/               logs of jobs started from the app
 outputs/models/<tag>/    fine-tuned weights + metadata.json + README.md (model card)
 ```

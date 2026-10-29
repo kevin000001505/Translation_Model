@@ -1,0 +1,38 @@
+# docker compose up --build    → app at http://localhost:7860
+#
+# Fill in .env first (cp .env.example .env). Subtitles, the catalog, converted GGUF models and
+# fine-tuned models are kept in ./data and ./outputs on the host.
+services:
+  subtune:
+    build:
+      context: .
+      args:
+        TORCH_INDEX_URL: ${TORCH_INDEX_URL:-https://download.pytorch.org/whl/rocm7.2}
+    image: subtune:latest
+    container_name: subtune
+    ports:
+      - "${SUBTUNE_PORT:-7860}:7860"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Container paths; these override any values in .env.
+      SUBTUNE_DATA_DIR: /data
+      SUBTUNE_OUTPUT_DIR: /outputs
+      HF_HOME: /hf-cache
+    volumes:
+      - ./data:/data
+      - ./outputs:/outputs
+      - hf-cache:/hf-cache
+    # AMD GPU (ROCm) for local training. The container runs as root, so no extra groups are needed.
+    # Without an AMD GPU, add -f docker-compose.no-gpu.yml (see README).
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    security_opt:
+      - seccomp=unconfined  # recommended by AMD for ROCm containers
+    shm_size: 8gb
+    restart: unless-stopped
+
+volumes:
+  hf-cache:  # downloaded base models from Hugging Face

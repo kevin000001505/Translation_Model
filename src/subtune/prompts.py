@@ -6,13 +6,16 @@ it will be scored with.
 
 from __future__ import annotations
 
-from .languages import HUNYUAN_CHINESE_NAMES, base_code, prompt_name
+from .languages import HUNYUAN_CHINESE_NAMES, base_code, iso_code, prompt_name
 
 
 def resolve_family(family: str, tokenizer) -> str:
     if family != "auto":
         return family
-    return "chat" if getattr(tokenizer, "chat_template", None) else "plain"
+    template = getattr(tokenizer, "chat_template", None) or ""
+    if "source_lang_code" in template:  # a TranslateGemma-style template (e.g. from a custom GGUF)
+        return "translategemma"
+    return "chat" if template else "plain"
 
 
 def _chinese_prompt(src_lang: str, tgt_lang: str) -> bool:
@@ -21,6 +24,11 @@ def _chinese_prompt(src_lang: str, tgt_lang: str) -> bool:
 
 
 def _messages(family: str, src_lang: str, tgt_lang: str, text: str) -> list[dict]:
+    if family == "translategemma":
+        # TranslateGemma's template takes one structured item with ISO codes (e.g. en -> zh-TW).
+        content = [{"type": "text", "source_lang_code": iso_code(src_lang),
+                    "target_lang_code": iso_code(tgt_lang), "text": text}]
+        return [{"role": "user", "content": content}]
     if family == "hy_mt2":  # wording from the Hy-MT2 model card ("Default Translation")
         if _chinese_prompt(src_lang, tgt_lang):
             instruction = f"将以下文本翻译为{HUNYUAN_CHINESE_NAMES[tgt_lang]}，注意只需要输出翻译后的结果，不要额外解释："
@@ -52,7 +60,7 @@ def _template(tokenizer, messages, **kw) -> str:
     return tokenizer.apply_chat_template(messages, tokenize=False, enable_thinking=False, **kw)
 
 
-def _end_marker(tokenizer) -> str:
+def end_marker(tokenizer) -> str:
     vocab = tokenizer.get_vocab()
     for tok in ("<end_of_turn>", "<|im_end|>", "<|eot_id|>"):
         if tok in vocab:
@@ -76,8 +84,13 @@ def build_texts(tokenizer, family: str, src_lang: str, tgt_lang: str, src: str, 
         full = ""
     if full.startswith(prompt) and tgt in full[len(prompt):]:
         completion = full[len(prompt):]
+        # Drop template whitespace before the answer (TranslateGemma's template renders "\n        "
+        # there), so training targets start exactly where generation does.
+        k = completion.find(tgt)
+        if k > 0 and not completion[:k].strip():
+            completion = completion[k:]
     else:
-        completion = tgt + _end_marker(tokenizer)
+        completion = tgt + end_marker(tokenizer)
     return prompt, completion
 
 

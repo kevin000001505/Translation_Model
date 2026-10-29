@@ -16,7 +16,7 @@ from typing import Callable
 import torch
 
 from .evaluate import score
-from .prompts import encode, resolve_family
+from .prompts import encode, end_marker, resolve_family
 from .runconfig import TrainConfig
 
 Log = Callable[[str], None]
@@ -46,7 +46,12 @@ def load_model(cfg: TrainConfig, log: Log):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     token = os.environ.get("HF_TOKEN") or None
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model_id, token=token, trust_remote_code=cfg.trust_remote_code)
+    source = cfg.model_id
+    if cfg.gguf_file:
+        from .gguf_convert import ensure_converted
+
+        source = str(ensure_converted(cfg.model_id, cfg.gguf_file, log))
+    tokenizer = AutoTokenizer.from_pretrained(source, token=token, trust_remote_code=cfg.trust_remote_code)
     kwargs = {"token": token, "trust_remote_code": cfg.trust_remote_code, "dtype": torch.bfloat16}
     if torch.cuda.is_available():
         kwargs["device_map"] = {"": 0}
@@ -57,7 +62,7 @@ def load_model(cfg: TrainConfig, log: Log):
             load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
             bnb_4bit_compute_dtype=torch.bfloat16,
         )
-    model = AutoModelForCausalLM.from_pretrained(cfg.model_id, **kwargs)
+    model = AutoModelForCausalLM.from_pretrained(source, **kwargs)
     if tokenizer.eos_token is None:
         # Some tokenizers (e.g. Seed-X) only declare EOS in the model config; without it the model
         # would never learn where a translation ends.
@@ -134,13 +139,18 @@ def translate(model, tokenizer, family: str, cfg: TrainConfig, sources: list[str
     tokenizer.padding_side = "left"
     out: list[str] = []
     device = next(model.parameters()).device
+    # Stop at the end of the assistant turn too (e.g. Gemma's <end_of_turn>), not only at EOS.
+    stop_ids = {tokenizer.eos_token_id}
+    if end_marker(tokenizer):
+        stop_ids.add(tokenizer.convert_tokens_to_ids(end_marker(tokenizer)))
+    stop_ids -= {None, tokenizer.unk_token_id}
     for i in range(0, len(sources), batch_size):
         prompts = [encode(tokenizer, family, cfg.src, cfg.tgt, s)[0] for s in sources[i : i + batch_size]]
         n = max(len(p) for p in prompts)
         ids = torch.tensor([[tokenizer.pad_token_id] * (n - len(p)) + p for p in prompts], device=device)
         mask = torch.tensor([[0] * (n - len(p)) + [1] * len(p) for p in prompts], device=device)
         gen = model.generate(input_ids=ids, attention_mask=mask, max_new_tokens=max_new_tokens, do_sample=False,
-                             pad_token_id=tokenizer.pad_token_id)
+                             pad_token_id=tokenizer.pad_token_id, eos_token_id=sorted(stop_ids) or None)
         for row in gen[:, n:]:
             text = tokenizer.decode(row, skip_special_tokens=True)
             out.append(text.split("</think>")[-1].strip().split("\n")[0].strip())

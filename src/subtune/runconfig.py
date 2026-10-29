@@ -9,7 +9,7 @@ from pathlib import Path
 
 @dataclass
 class TrainConfig:
-    model_id: str
+    model_id: str  # Hugging Face repo id (for GGUF: the repo holding gguf_file)
     family: str
     src: str
     tgt: str
@@ -18,6 +18,7 @@ class TrainConfig:
     gpu: str = ""  # Modal GPU type
     max_hours: float = 8  # Modal hard time limit: the GPU is stopped (and billing ends) by then at the latest
     trust_remote_code: bool = False
+    gguf_file: str = ""  # train from this GGUF file in model_id (converted to bf16 first)
     epochs: float = 1
     max_pairs: int = 0  # 0 = all
     learning_rate: float = 2e-4

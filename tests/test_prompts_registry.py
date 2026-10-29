@@ -36,6 +36,34 @@ def test_chat_prompt_and_completion_split_cleanly():
     assert completion == "你好。<|im_end|>\n"
 
 
+def test_translategemma_uses_language_codes():
+    tok = FakeChatTokenizer()
+    prompt, _ = build_texts(tok, "translategemma", "en", "zh-tw", "Hello.")
+    assert '"source_lang_code": "en"' in prompt and '"target_lang_code": "zh-TW"' in prompt
+
+
+def test_template_whitespace_before_answer_is_dropped():
+    class IndentingTokenizer(FakeChatTokenizer):
+        def apply_chat_template(self, messages, add_generation_prompt=False, **kw):
+            text = "<start_of_turn>user\nhi<end_of_turn>\n"
+            if len(messages) > 1:  # like TranslateGemma's template: indentation leaks before the answer
+                text += "<start_of_turn>model\n\n        " + messages[1]["content"] + "<end_of_turn>\n"
+            return text + ("<start_of_turn>model\n" if add_generation_prompt else "")
+
+    _, completion = build_texts(IndentingTokenizer(), "chat", "en", "zh-tw", "Hi.", "你好。")
+    assert completion == "你好。<end_of_turn>\n"
+
+
+def test_auto_family_detects_translategemma_template():
+    from subtune.prompts import resolve_family
+
+    tok = FakeChatTokenizer()
+    tok.chat_template = "{% set source_lang_code = content['source_lang_code'] %}"
+    assert resolve_family("auto", tok) == "translategemma"
+    tok.chat_template = "chatml"
+    assert resolve_family("auto", tok) == "chat"
+
+
 def test_hy_mt2_uses_its_documented_prompts():
     tok = FakeChatTokenizer()
     prompt, _ = build_texts(tok, "hy_mt2", "en", "zh-tw", "Hello.")
@@ -72,11 +100,27 @@ def test_tag_metadata_and_listing(tmp_path):
 
 
 def test_curated_models_and_gpu_suggestions():
-    assert {m.family for m in MODELS} == {"hy_mt2", "hunyuan_mt", "seedx", "chat"}
-    assert not any("translategemma" in m.model_id or m.model_id.startswith("google/") for m in MODELS)
+    assert {m.family for m in MODELS} == {"translategemma", "hy_mt2", "hunyuan_mt", "seedx", "chat"}
+    assert not any(m.model_id.startswith("google/") for m in MODELS)  # Google's own repos are gated
+    gguf = [m for m in MODELS if m.gguf_file]
+    assert [m.label for m in gguf] == ["TranslateGemma 4B (GGUF f16)", "TranslateGemma 12B (GGUF Q8_0)",
+                                       "TranslateGemma 27B (GGUF Q8_0)"]
+    assert all(m.gguf_file.endswith((".f16.gguf", ".Q8_0.gguf")) for m in gguf)
     assert estimate_vram_gb("QLoRA", 14.8) < 32 < estimate_vram_gb("LoRA", 14.8)
     assert suggest_gpu("LoRA", 7.5) == "L40S"
     assert suggest_gpu("Full", 7.5) == "H200"
+
+
+def test_gguf_names_and_file_listing(monkeypatch):
+    import huggingface_hub
+
+    from subtune.models import gguf_files
+    from subtune.registry import model_short_name
+
+    assert model_short_name("mradermacher/translategemma-4b-it-GGUF") == "translategemma-4b"
+    monkeypatch.setattr(huggingface_hub, "list_repo_files", lambda repo, token=None: [
+        "README.md", "m.Q4_K_M.gguf", "m.f16.gguf", "m.mmproj-f16.gguf"])
+    assert gguf_files("org/m-GGUF") == ["m.Q4_K_M.gguf", "m.f16.gguf"]  # vision projector left out
 
 
 def test_only_ungated_models_are_allowed(monkeypatch):

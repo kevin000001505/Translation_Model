@@ -15,6 +15,7 @@ from .runconfig import TrainConfig
 
 def model_short_name(model_id: str) -> str:
     name = model_id.rstrip("/").split("/")[-1].lower()
+    name = re.sub(r"[-_.]gguf$", "", name)
     return re.sub(r"-(it|instruct)$", "", name)
 
 
@@ -33,6 +34,7 @@ def write_metadata(out_dir: Path, tag: str, cfg: TrainConfig, data: dict, metric
         "tag": tag,
         "created": dt.datetime.now().isoformat(timespec="seconds"),
         "base_model": cfg.model_id,
+        "base_model_gguf_file": cfg.gguf_file or None,
         "method": cfg.method,
         "language_pair": f"{src}-{tgt}",
         "source_language": {"code": src, "name": LANGUAGES.get(cfg.src, cfg.src)},
@@ -75,8 +77,9 @@ def model_card(meta: dict) -> str:
         "",
         f"# {meta['tag']}",
         "",
-        f"{meta['method']} fine-tune of `{meta['base_model']}` for **{src['name']} → {tgt['name']}** "
-        f"subtitle translation, trained on OpenSubtitles.",
+        f"{meta['method']} fine-tune of `{meta['base_model']}`"
+        + (f" (GGUF file `{meta['base_model_gguf_file']}`)" if meta.get("base_model_gguf_file") else "")
+        + f" for **{src['name']} → {tgt['name']}** subtitle translation, trained on OpenSubtitles.",
         "",
         "| | chrF | BLEU |",
         "|---|---|---|",

@@ -71,7 +71,7 @@ def test_finished_run_stops_app_caps_time_and_cleans_volume(fake, tmp_path):
     logs = []
     modal_app.run_on_modal(_cfg(max_hours=3), tmp_path / "run1", "t", tmp_path / "out", logs.append)
     assert not f.app_running
-    assert f.options == {"gpu": "L40S", "timeout": 3 * 3600}
+    assert f.options == {"gpu": "L40S", "timeout": 3 * 3600, "memory": None}  # default RAM, not billed extra
     assert (tmp_path / "out" / "adapter" / "w.bin").read_bytes() == b"weights"
     assert f.removed == ["models/t", "runs/run1"]
     assert any("cloud GPU is released" in m for m in logs)
@@ -84,6 +84,14 @@ def test_failed_run_still_stops_app(fake, tmp_path):
         modal_app.run_on_modal(_cfg(), tmp_path / "run1", "t", tmp_path / "out", logs.append)
     assert not f.app_running
     assert any("cloud GPU is released" in m for m in logs)
+
+
+def test_gguf_runs_reserve_ram_for_conversion(fake, tmp_path):
+    f = fake()
+    cfg = _cfg()
+    cfg.model_id, cfg.gguf_file = "mradermacher/translategemma-27b-it-GGUF", "translategemma-27b-it.Q8_0.gguf"
+    modal_app.run_on_modal(cfg, tmp_path / "run1", "t", tmp_path / "out", lambda m: None)
+    assert f.options["memory"] >= 27 * 2 * 1024  # bf16 copy of 27B parameters
 
 
 def test_time_limit_is_clamped_to_modal_maximum(fake, tmp_path):
