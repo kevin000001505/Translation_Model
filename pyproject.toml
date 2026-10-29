@@ -1,0 +1,43 @@
+[project]
+name = "subtune"
+version = "0.1.0"
+description = "Fine-tune translation LLMs on OpenSubtitles parallel subtitles, with a Gradio UI."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "gradio>=5.0",
+    "pandas>=2.0",
+    "numpy>=1.26",
+    "requests>=2.31",
+    "python-dotenv>=1.0",
+    "charset-normalizer>=3.0",
+    "sacrebleu>=2.4",
+]
+
+[project.optional-dependencies]
+# torch is installed separately so you can pick the ROCm or CUDA wheel (see README).
+train = [
+    "transformers>=4.56",
+    "peft>=0.13",
+    "accelerate>=1.0",
+    "sentencepiece",
+    "protobuf",
+]
+qlora = ["bitsandbytes>=0.45"]
+cloud = ["modal>=1.0"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+subtune = "subtune.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
