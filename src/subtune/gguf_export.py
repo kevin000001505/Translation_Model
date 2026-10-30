@@ -123,7 +123,9 @@ def _from_gguf(kind: str, root: Path, base_gguf: Path, converted_dir: str, weigh
     merged = dest if kind == "F16" else work / "merged-f16.gguf"  # export-lora always writes F16
     _run([export_lora, "-m", base_gguf, "--lora", lora, "-o", merged], log)
     if kind != "F16":
-        _run([quantize, merged, dest, kind], log)
+        # export-lora writes merged tensors as F16 but keeps untouched ones (e.g. token_embd) in the
+        # base file's type, such as Q8_0; llama-quantize refuses those without --allow-requantize.
+        _run([quantize, "--allow-requantize", merged, dest, kind], log)
 
 
 def export_gguf(kind: str, source: str, weights_dir: Path, is_adapter: bool, out_dir: Path, work: Path,

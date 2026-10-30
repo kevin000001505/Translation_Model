@@ -16,6 +16,7 @@ stops as soon as this script exits, fails, or loses its connection. On top of th
 from __future__ import annotations
 
 import os
+import queue
 import threading
 import time
 from pathlib import Path
@@ -119,7 +120,11 @@ class _relay:
         self.seen = False
 
     def _drain(self, block: bool) -> None:
-        for line in self.queue.get_many(100, block=block, timeout=5 if block else None):
+        try:
+            lines = self.queue.get_many(100, block=block, timeout=5 if block else None)
+        except queue.Empty:  # Modal raises this when nothing arrived within the timeout: normal
+            return
+        for line in lines:
             self.log(str(line))
             self.last, self.seen = time.time(), True
 
@@ -128,7 +133,7 @@ class _relay:
             try:
                 self._drain(block=True)
             except Exception as exc:  # keep relaying; a transient queue error must not end the job
-                self.log(f"(could not read cloud log: {exc})")
+                self.log(f"(could not read cloud log: {type(exc).__name__}: {exc})")
                 self.stop.wait(5)
             quiet = time.time() - self.last
             if quiet >= self.QUIET_SECONDS:

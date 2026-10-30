@@ -26,7 +26,8 @@ def fake_llama(monkeypatch, tmp_path):
             if flag in cmd:
                 Path(cmd[cmd.index(flag) + 1]).write_bytes(b"gguf")
         if Path(cmd[0]).name == "llama-quantize":
-            Path(cmd[2]).write_bytes(b"gguf")
+            positional = [a for a in cmd[1:] if not a.startswith("--")]
+            Path(positional[1]).write_bytes(b"gguf")
         if env is not None:
             assert env["PYTHONPATH"].startswith(str(root / "gguf-py"))  # llama.cpp's own gguf-py first
 
@@ -87,6 +88,8 @@ def test_gguf_base_merges_lora_into_original_file(fake_llama, tmp_path):
     lora_cmd, merge_cmd = calls[2], calls[3]
     assert lora_cmd[lora_cmd.index("--base") + 1] == "/src/model" and lora_cmd[-1] == str(tmp_path / "adapter")
     assert merge_cmd[merge_cmd.index("-m") + 1] == str(base)  # original file: its tokenizer is kept
+    # export-lora keeps untouched tensors in the base file's Q8_0: re-quantizing them must be allowed
+    assert "--allow-requantize" in calls[4]
 
 
 def test_gguf_base_f16_skips_quantize(fake_llama, tmp_path):

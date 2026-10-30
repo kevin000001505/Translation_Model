@@ -1,5 +1,6 @@
 """The cloud GPU must stop when a run ends, fails, or is stopped from the UI."""
 
+import queue
 import signal
 import subprocess
 import sys
@@ -25,6 +26,8 @@ class FakeQueue:
     def get_many(self, n, block=True, timeout=None):
         if not self.items and block:
             time.sleep(min(timeout or 0, 0.05))
+            if not self.items:
+                raise queue.Empty()  # what modal.Queue does when the timeout passes with nothing
         out, self.items = self.items[:n], self.items[n:]
         return out
 
@@ -111,9 +114,10 @@ def test_failed_run_still_stops_app(fake, tmp_path):
 
 
 def test_cloud_training_log_reaches_the_local_log(fake, tmp_path):
-    fake()
+    fake(quiet_for=0.3)  # several empty timeouts before the first line
     logs = []
     modal_app.run_on_modal(_cfg(), tmp_path / "run1", "t", tmp_path / "out", logs.append)
+    assert not any("could not read cloud log" in m for m in logs)  # empty timeouts are not errors
     assert "Modal dashboard for this run: https://modal.com/id/ap-test" in logs
     i, j = logs.index("Step 1/4: preparing the base model."), logs.index("step 10/100 epoch 0.10 loss 1.2345 lr 2.00e-04")
     assert i < j < next(k for k, m in enumerate(logs) if "cloud GPU is released" in m)
