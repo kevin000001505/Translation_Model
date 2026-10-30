@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 import gradio as gr
 import pandas as pd
@@ -155,14 +156,23 @@ def start_download(src: str, tgt: str, selected: list[str], members: dict):
     return "Download started (most popular selected titles first)."
 
 
-def poll_data(was_running: bool, src: str, tgt: str, selected, kind, search):
+LIVE_RELOAD_SECONDS = 30
+
+
+def poll_data(was_running: bool, last_reload: float, src: str, tgt: str, selected, kind, search):
     status, log = JOBS.view("data")
     job = JOBS.jobs.get("data")
     running = bool(job and job.running)
-    if was_running and not running:  # a scan or download just finished: refresh the list
+    now = time.time()
+    # Refresh the list when a job just finished, and when a scan of these languages (started here
+    # or with `subtune scan` on the command line) has saved progress since the last refresh: at most
+    # every 30 s while it runs, right away once it has finished.
+    saved_at, scanning = _catalog().scan_marker(src, tgt) if src != tgt else (0.0, False)
+    progressed = saved_at > last_reload and (not scanning or now - last_reload >= LIVE_RELOAD_SECONDS)
+    if (was_running and not running) or progressed:
         df, members, text = load_listing(src, tgt)
-        return status, log, running, df, members, text, render_table(df, selected, kind, search)
-    return status, log, running, gr.skip(), gr.skip(), gr.skip(), gr.skip()
+        return status, log, running, now, df, members, text, render_table(df, selected, kind, search)
+    return status, log, running, last_reload, gr.skip(), gr.skip(), gr.skip(), gr.skip()
 
 
 # --- train tab ------------------------------------------------------------------------------
@@ -373,6 +383,7 @@ def build_ui() -> gr.Blocks:
         st_members = gr.State({})
         st_selected = gr.State([])
         st_data_running = gr.State(False)
+        st_last_reload = gr.State(0.0)
 
         with gr.Row():
             src = gr.Dropdown(lang_choices, value="en", label="Source language")
@@ -501,8 +512,8 @@ def build_ui() -> gr.Blocks:
         stop_train.click(lambda: JOBS.stop("train"), None, train_status)
 
         timer = gr.Timer(2.0)
-        timer.tick(poll_data, [st_data_running, src, tgt, st_selected, kind, search],
-                   [data_status, data_log, st_data_running, st_df, st_members, listing_md, table])
+        timer.tick(poll_data, [st_data_running, st_last_reload, src, tgt, st_selected, kind, search],
+                   [data_status, data_log, st_data_running, st_last_reload, st_df, st_members, listing_md, table])
         timer.tick(poll_train, None, [train_status, train_log])
 
         demo.load(refresh_models, None, [models_df, model_pick])

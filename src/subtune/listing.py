@@ -44,12 +44,25 @@ def _is_capped(total_pages: int, per_page: int, total_count: int) -> bool:
 
 
 def _year_slices() -> list[dict]:
+    """Newest years first, so recent (most-watched) titles show up early while the scan runs."""
     last = dt.date.today().year + 1
     return [
         {"params": {"type": ftype, "year": year}, "next_page": 1, "total_pages": None}
+        for year in range(last, FIRST_YEAR - 1, -1)
         for ftype in ("movie", "episode")
-        for year in range(FIRST_YEAR, last + 1)
     ]
+
+
+def _slice_done(sl: dict) -> bool:
+    return sl["total_pages"] is not None and sl["next_page"] > sl["total_pages"]
+
+
+def _newest_first(state: dict) -> dict:
+    """Reorder a resumed year scan (older versions went oldest-first): finished slices first, so
+    they are skipped, then the remaining ones from the newest year down."""
+    if state.get("mode") == "years":
+        state["slices"].sort(key=lambda sl: (not _slice_done(sl), -sl["params"]["year"], sl["params"]["type"]))
+    return state
 
 
 def _refused(exc: OpenSubtitlesError) -> bool:
@@ -110,16 +123,20 @@ def scan_language(
         progress(f"Scan of '{language}' already complete ({existing['total_count']} subtitles).")
         return
     if existing and existing["status"] == "running" and not refresh:
-        state = existing["state"]
+        state = _newest_first(existing["state"])
         total_count = existing["total_count"]
         progress(f"Resuming scan of '{language}'.")
+        # Titles found before this resume (older versions counted them only at the very end).
+        catalog.recount_presence(language)
+        if secondary:
+            check_secondary(client, catalog, language, secondary, progress)
     else:
         state = {"mode": "all", "slices": [{"params": {}, "next_page": 1, "total_pages": None}], "fetched": 0}
         total_count = None
 
     while state["mode"] != "imdb":
         try:
-            state, total_count = _scan_paged(client, catalog, language, state, total_count, progress)
+            state, total_count = _scan_paged(client, catalog, language, state, total_count, progress, secondary)
             break
         except OpenSubtitlesError as exc:
             if not _refused(exc):
@@ -142,8 +159,10 @@ def scan_language(
              f"{len(catalog.features_with(language))} titles/episodes.")
 
 
-def _scan_paged(client, catalog, language, state, total_count, progress):
-    """Page through `language` subtitles slice by slice ("all" or "years" mode)."""
+def _scan_paged(client, catalog, language, state, total_count, progress, secondary=None):
+    """Page through `language` subtitles slice by slice ("all" or "years" mode). Each title found is
+    counted and checked for `secondary` right away, so the list fills while the scan runs."""
+    checked = _checked(catalog, secondary)
     i = 0
     while i < len(state["slices"]):
         sl = state["slices"][i]
@@ -179,8 +198,9 @@ def _scan_paged(client, catalog, language, state, total_count, progress):
                 i = -1
                 break
             with catalog.tx():
-                for item in data:
-                    catalog.record_search_item(item)
+                found = {f[0] for item in data if (f := catalog.record_search_item(item))}
+            catalog.recount_presence(language, sorted(found))
+            _check_new(client, catalog, found, secondary, checked)
             state["fetched"] += len(data)
             sl["next_page"] += 1
             catalog.save_lang_scan(language, "running", state, total_count)
@@ -192,6 +212,23 @@ def _scan_paged(client, catalog, language, state, total_count, progress):
                 break
         i += 1
     return state, total_count
+
+
+def _checked(catalog: Catalog, secondary: str | None) -> set[int]:
+    if not secondary:
+        return set()
+    return {f for f, in catalog.conn.execute("SELECT feature_id FROM presence WHERE language=?", (secondary,))}
+
+
+def _check_new(client, catalog, feature_ids, secondary, checked) -> int:
+    """Check `secondary` for features not checked yet; returns how many have it."""
+    found = 0
+    if secondary:
+        for feature_id in sorted(feature_ids):
+            if feature_id not in checked:
+                found += _check_feature(client, catalog, feature_id, secondary) > 0
+                checked.add(feature_id)
+    return found
 
 
 def _check_feature(client: OpenSubtitlesClient, catalog: Catalog, feature_id: int, language: str) -> int:
@@ -211,8 +248,7 @@ def _scan_imdb(client, catalog, language, secondary, state, progress) -> dict:
     """Look up `language` subtitles for each IMDb candidate title, resuming at state["next"]."""
     titles = imdb.candidates(get_paths().data, state["min_votes"], progress)
     state["total"] = len(titles)
-    checked = {f for f, in catalog.conn.execute("SELECT feature_id FROM presence WHERE language=?", (secondary,))} \
-        if secondary else set()
+    checked = _checked(catalog, secondary)
     for n in range(state["next"], len(titles)):
         imdb_id, kind, _votes, _title, _year = titles[n]
         id_param = {"imdb_id": imdb_id} if kind == "movie" else {"parent_imdb_id": imdb_id}
@@ -231,12 +267,7 @@ def _scan_imdb(client, catalog, language, secondary, state, progress) -> dict:
         with catalog.tx():
             for feature_id, count in counts.items():
                 catalog.set_presence(feature_id, language, count)
-        if secondary:
-            for feature_id in counts:
-                if feature_id not in checked:
-                    if _check_feature(client, catalog, feature_id, secondary):
-                        state["found"] += 1
-                    checked.add(feature_id)
+        state["found"] += _check_new(client, catalog, counts, secondary, checked)
         state["next"] = n + 1
         if state["next"] % 20 == 0 or state["next"] == len(titles):
             catalog.save_lang_scan(language, "running", state, None)

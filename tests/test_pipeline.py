@@ -142,3 +142,58 @@ def test_listing_works_when_the_api_refuses_broad_searches(env, monkeypatch, tmp
     assert any(mode in m for m in messages)
     assert cat.get_lang_scan("zh-tw")["status"] == "done"
     assert "Not scanned" not in listing_status(cat, "en", "zh-tw")
+
+
+def _interrupt_at_year(fake, year):
+    real = fake.request
+
+    def request(method, url, params=None, **kw):
+        if dict(params or []).get("year") == str(year):
+            raise KeyboardInterrupt  # the scan is stopped (or still running) at this point
+        return real(method, url, params=params, **kw)
+
+    fake.request = request
+    return real
+
+
+def test_titles_appear_while_the_scan_is_still_running(env, monkeypatch, tmp_path):
+    """Regression: the list stayed empty until the whole year-by-year scan had finished."""
+    monkeypatch.setenv("SUBTUNE_DATA_DIR", str(tmp_path / "data"))
+    fake, client, cat, paths = env(refuse="language")
+    real = _interrupt_at_year(fake, 2003)  # newest years first: 2004 (Delta) is already done
+    with pytest.raises(KeyboardInterrupt):
+        build_listing(client, cat, "en", "zh-tw", progress=lambda m: None)
+    assert list(titles_table(cat, "en", "zh-tw")[0]["Title"]) == ["Delta"]
+    assert cat.scan_running("zh-tw")
+
+    fake.request = real  # resume
+    build_listing(client, cat, "en", "zh-tw", progress=lambda m: None)
+    assert list(titles_table(cat, "en", "zh-tw")[0]["Title"]) == ["Alpha", "Show", "Delta"]
+    assert not cat.scan_running("zh-tw")
+
+
+def test_resuming_an_oldest_first_scan_from_the_previous_version(env, monkeypatch, tmp_path):
+    from subtune.listing import _year_slices
+
+    monkeypatch.setenv("SUBTUNE_DATA_DIR", str(tmp_path / "data"))
+    fake, client, cat, paths = env(refuse="language")
+    # Saved by the previous version: years ascending, movies done up to 2001, Alpha (2001) stored
+    # but never counted (presence was only computed at the very end).
+    slices = sorted(_year_slices(), key=lambda sl: (sl["params"]["type"], sl["params"]["year"]))
+    for sl in slices:
+        if sl["params"]["type"] == "movie" and sl["params"]["year"] <= 2001:
+            sl["total_pages"], sl["next_page"] = 1, 2
+    with cat.tx():
+        for s in fake.subs:
+            if s["feature_id"] == 1 and s["language"] == "zh-tw":
+                cat.record_search_item(fake._item(s))
+    cat.save_lang_scan("zh-tw", "running", {"mode": "years", "slices": slices, "fetched": 1}, None)
+
+    real = _interrupt_at_year(fake, 2003)
+    with pytest.raises(KeyboardInterrupt):
+        build_listing(client, cat, "en", "zh-tw", progress=lambda m: None)
+    assert "Alpha" in set(titles_table(cat, "en", "zh-tw")[0]["Title"])  # found before the resume
+
+    fake.request = real
+    build_listing(client, cat, "en", "zh-tw", progress=lambda m: None)
+    assert list(titles_table(cat, "en", "zh-tw")[0]["Title"]) == ["Alpha", "Show", "Delta"]

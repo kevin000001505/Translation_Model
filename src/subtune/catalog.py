@@ -195,17 +195,36 @@ class Catalog:
             "INSERT OR REPLACE INTO presence VALUES (?,?,?,?)", (feature_id, language, n_subs, time.time())
         )
 
-    def recount_presence(self, language: str) -> None:
-        """Set presence for a language from the subtitles stored for it (after a full scan)."""
+    def recount_presence(self, language: str, feature_ids: list[int] | None = None) -> None:
+        """Set presence for a language from the subtitles stored for it (all features, or some)."""
         now = time.time()
+        only = ""
+        args: list = [now, language]
+        if feature_ids is not None:
+            if not feature_ids:
+                return
+            only = f" AND feature_id IN ({','.join('?' * len(feature_ids))})"
+            args += list(feature_ids)
         with self.tx() as c:
             c.execute(
-                """INSERT OR REPLACE INTO presence
+                f"""INSERT OR REPLACE INTO presence
                    SELECT feature_id, language, COUNT(*), ? FROM subtitles
-                   WHERE language=? AND ai_translated=0 AND machine_translated=0
+                   WHERE language=? AND ai_translated=0 AND machine_translated=0{only}
                    GROUP BY feature_id""",
-                (now, language),
+                args,
             )
+
+    def scan_running(self, *languages: str) -> bool:
+        return self.scan_marker(*languages)[1]
+
+    def scan_marker(self, *languages: str) -> tuple[float, bool]:
+        """(last time a scan of these languages saved progress, whether one is running)."""
+        marks = ",".join("?" * len(languages))
+        row = self.conn.execute(
+            f"SELECT MAX(updated_at), MAX(status='running') FROM lang_scans WHERE language IN ({marks})",
+            languages,
+        ).fetchone()
+        return float(row[0] or 0), bool(row[1])
 
     # --- scan state -----------------------------------------------------------------------
 
