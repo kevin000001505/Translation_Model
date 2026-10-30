@@ -2,10 +2,18 @@
 
 The API cannot filter on "has subtitles in A and B", so we:
 
-1. Pick the rarer language as *primary* and page through all of its subtitles (no quota cost).
-   This gives every feature that has the primary language.
+1. Pick the rarer language as *primary* and collect every feature that has subtitles in it
+   (searches cost no quota).
 2. For each of those features, ask whether it has subtitles in the *secondary* language
    (one search per feature; also stores the candidates we may later download).
+
+Step 1 uses the broadest search the API accepts. The API answers "Not enough parameters" to a
+search by language alone, so the scan falls back automatically:
+
+- ``all``    language only, paged (if the API ever allows it);
+- ``years``  language + year + movie/episode, paged per year (covers the whole catalog);
+- ``imdb``   language + IMDb id, for every IMDb title above a vote threshold (imdb.py), most-voted
+             first; the secondary language is checked right away, so the list fills while it runs.
 
 Both steps are resumable and cached in the catalog, and are shared between language pairs:
 a scan of zh-tw done for en→zh-tw is reused for ja→zh-tw.
@@ -17,8 +25,10 @@ import datetime as dt
 import logging
 from typing import Callable
 
+from . import imdb
 from .catalog import Catalog
-from .opensubtitles import OpenSubtitlesClient
+from .config import get_paths
+from .opensubtitles import OpenSubtitlesClient, OpenSubtitlesError
 
 log = logging.getLogger(__name__)
 
@@ -42,13 +52,18 @@ def _year_slices() -> list[dict]:
     ]
 
 
+def _refused(exc: OpenSubtitlesError) -> bool:
+    """The API's answer to a search it considers too broad."""
+    return "HTTP 400" in str(exc) and "parameters" in str(exc).lower()
+
+
 def language_total(client: OpenSubtitlesClient, language: str) -> int:
     page = client.search_subtitles(languages=language, page=1, **QUALITY_FILTERS)
     return int(page.get("total_count") or 0)
 
 
 def choose_primary(client: OpenSubtitlesClient, catalog: Catalog, src: str, tgt: str, progress: Progress) -> tuple[str, str]:
-    """Primary = the language with fewer subtitles (cheaper to scan in full)."""
+    """Primary = the language with fewer subtitles (cheaper to scan)."""
     for lang, other in ((src, tgt), (tgt, src)):
         scan = catalog.get_lang_scan(lang)
         if scan and scan["status"] == "done":
@@ -57,16 +72,39 @@ def choose_primary(client: OpenSubtitlesClient, catalog: Catalog, src: str, tgt:
             if not other_scan or (scan["total_count"] or 0) <= (other_scan["total_count"] or 0):
                 progress(f"Reusing finished scan of '{lang}' subtitles.")
                 return lang, other
-    counts = {lang: language_total(client, lang) for lang in (src, tgt)}
+    try:
+        counts = {lang: language_total(client, lang) for lang in (src, tgt)}
+    except OpenSubtitlesError as exc:
+        if not _refused(exc):
+            raise
+        # Totals per language are not available: English is by far the largest language, so the
+        # other one is the rarer; between two non-English languages, use the target.
+        primary = tgt if src == "en" or tgt != "en" else src
+        return primary, (tgt if primary == src else src)
     progress(f"Subtitle counts: {counts}")
     primary = min(counts, key=counts.get)
     return primary, (tgt if primary == src else src)
 
 
+def _accepts_year_search(client: OpenSubtitlesClient, language: str) -> bool:
+    try:
+        client.search_subtitles(languages=language, type="movie", year=2015, page=1, **QUALITY_FILTERS)
+        return True
+    except OpenSubtitlesError as exc:
+        if _refused(exc):
+            return False
+        raise
+
+
 def scan_language(
-    client: OpenSubtitlesClient, catalog: Catalog, language: str, progress: Progress, refresh: bool = False
+    client: OpenSubtitlesClient,
+    catalog: Catalog,
+    language: str,
+    progress: Progress,
+    refresh: bool = False,
+    secondary: str | None = None,
 ) -> None:
-    """Page through every subtitle in `language`, storing features and candidates."""
+    """Collect every feature with subtitles in `language`, storing features and candidates."""
     existing = catalog.get_lang_scan(language)
     if existing and existing["status"] == "done" and not refresh:
         progress(f"Scan of '{language}' already complete ({existing['total_count']} subtitles).")
@@ -79,6 +117,33 @@ def scan_language(
         state = {"mode": "all", "slices": [{"params": {}, "next_page": 1, "total_pages": None}], "fetched": 0}
         total_count = None
 
+    while state["mode"] != "imdb":
+        try:
+            state, total_count = _scan_paged(client, catalog, language, state, total_count, progress)
+            break
+        except OpenSubtitlesError as exc:
+            if not _refused(exc):
+                raise
+            if state["mode"] == "all" and _accepts_year_search(client, language):
+                progress("The API refuses searches by language alone; scanning year by year instead.")
+                state = {"mode": "years", "slices": _year_slices(), "fetched": state["fetched"]}
+            else:
+                state = {"mode": "imdb", "next": 0, "min_votes": imdb.min_votes(), "fetched": state["fetched"],
+                         "found": 0}
+                progress("The API refuses broad searches; looking titles up by IMDb id instead "
+                         f"(IMDb titles with at least {state['min_votes']} votes, most-voted first).")
+            catalog.save_lang_scan(language, "running", state, total_count)
+    if state["mode"] == "imdb":
+        state = _scan_imdb(client, catalog, language, secondary, state, progress)
+
+    catalog.recount_presence(language)
+    catalog.save_lang_scan(language, "done", state, total_count)
+    progress(f"Scan of '{language}' complete: {state['fetched']} subtitles, "
+             f"{len(catalog.features_with(language))} titles/episodes.")
+
+
+def _scan_paged(client, catalog, language, state, total_count, progress):
+    """Page through `language` subtitles slice by slice ("all" or "years" mode)."""
     i = 0
     while i < len(state["slices"]):
         sl = state["slices"][i]
@@ -126,11 +191,60 @@ def scan_language(
             if total_pages == 0:
                 break
         i += 1
+    return state, total_count
 
-    catalog.recount_presence(language)
-    catalog.save_lang_scan(language, "done", state, total_count)
-    progress(f"Scan of '{language}' complete: {state['fetched']} subtitles, "
-             f"{len(catalog.features_with(language))} titles/episodes.")
+
+def _check_feature(client: OpenSubtitlesClient, catalog: Catalog, feature_id: int, language: str) -> int:
+    """Store `language` subtitle candidates of one feature; returns how many it has."""
+    page = client.search_subtitles(
+        id=feature_id, languages=language, order_by="download_count", order_direction="desc", **QUALITY_FILTERS
+    )
+    with catalog.tx():
+        for item in page.get("data") or []:
+            catalog.record_search_item(item)
+        count = int(page.get("total_count") or 0)
+        catalog.set_presence(feature_id, language, count)
+    return count
+
+
+def _scan_imdb(client, catalog, language, secondary, state, progress) -> dict:
+    """Look up `language` subtitles for each IMDb candidate title, resuming at state["next"]."""
+    titles = imdb.candidates(get_paths().data, state["min_votes"], progress)
+    state["total"] = len(titles)
+    checked = {f for f, in catalog.conn.execute("SELECT feature_id FROM presence WHERE language=?", (secondary,))} \
+        if secondary else set()
+    for n in range(state["next"], len(titles)):
+        imdb_id, kind, _votes, _title, _year = titles[n]
+        id_param = {"imdb_id": imdb_id} if kind == "movie" else {"parent_imdb_id": imdb_id}
+        counts: dict[int, int] = {}
+        page_no, total_pages = 1, 1
+        while page_no <= total_pages:
+            page = client.search_subtitles(languages=language, page=page_no, **id_param, **QUALITY_FILTERS)
+            total_pages = int(page.get("total_pages") or 0)
+            with catalog.tx():
+                for item in page.get("data") or []:
+                    found = catalog.record_search_item(item)
+                    if found:
+                        counts[found[0]] = counts.get(found[0], 0) + 1
+            state["fetched"] += len(page.get("data") or [])
+            page_no += 1
+        with catalog.tx():
+            for feature_id, count in counts.items():
+                catalog.set_presence(feature_id, language, count)
+        if secondary:
+            for feature_id in counts:
+                if feature_id not in checked:
+                    if _check_feature(client, catalog, feature_id, secondary):
+                        state["found"] += 1
+                    checked.add(feature_id)
+        state["next"] = n + 1
+        if state["next"] % 20 == 0 or state["next"] == len(titles):
+            catalog.save_lang_scan(language, "running", state, None)
+        if state["next"] % 200 == 0 or state["next"] == len(titles):
+            both = f"; {state['found']} movies/episodes have both languages" if secondary else ""
+            progress(f"IMDb titles checked: {state['next']}/{len(titles)}{both}. "
+                     "Reload the table to see them while the scan continues.")
+    return state
 
 
 def check_secondary(
@@ -142,15 +256,7 @@ def check_secondary(
     progress(f"Checking {len(todo)} titles/episodes for '{secondary}' subtitles.")
     found = 0
     for n, feature_id in enumerate(todo, 1):
-        page = client.search_subtitles(
-            id=feature_id, languages=secondary, order_by="download_count", order_direction="desc", **QUALITY_FILTERS
-        )
-        with catalog.tx():
-            for item in page.get("data") or []:
-                catalog.record_search_item(item)
-            count = int(page.get("total_count") or 0)
-            catalog.set_presence(feature_id, secondary, count)
-        found += count > 0
+        found += _check_feature(client, catalog, feature_id, secondary) > 0
         if n % 100 == 0 or n == len(todo):
             progress(f"Checked {n}/{len(todo)}; {found} have '{secondary}' so far.")
     catalog.set_pair_check(primary, secondary, "done")
@@ -165,8 +271,8 @@ def build_listing(
     refresh: bool = False,
 ) -> None:
     primary, secondary = choose_primary(client, catalog, src, tgt, progress)
-    progress(f"Primary (scanned in full): '{primary}'. Secondary (checked per title): '{secondary}'.")
-    scan_language(client, catalog, primary, progress, refresh=refresh)
+    progress(f"Primary (scanned): '{primary}'. Secondary (checked per title): '{secondary}'.")
+    scan_language(client, catalog, primary, progress, refresh=refresh, secondary=secondary)
     check_secondary(client, catalog, primary, secondary, progress)
     progress(f"Done: {len(catalog.pair_features(src, tgt))} titles/episodes have both '{src}' and '{tgt}'.")
 
@@ -179,5 +285,8 @@ def listing_status(catalog: Catalog, src: str, tgt: str) -> str:
         if scan:
             check = catalog.get_pair_check(primary, secondary) or "not started"
             when = dt.datetime.fromtimestamp(scan["updated_at"]).strftime("%Y-%m-%d %H:%M")
-            parts.append(f"scan of '{primary}': {scan['status']} ({when}); check of '{secondary}': {check}")
+            st = scan["state"]
+            how = (f", by IMDb id: {st.get('next', 0)}/{st.get('total', '?')} titles with ≥{st['min_votes']} votes"
+                   if st.get("mode") == "imdb" else "")
+            parts.append(f"scan of '{primary}': {scan['status']}{how} ({when}); check of '{secondary}': {check}")
     return "; ".join(parts) if parts else "Not scanned yet."

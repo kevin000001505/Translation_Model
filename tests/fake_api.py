@@ -47,9 +47,13 @@ class _Resp:
 
 class FakeOpenSubtitles:
     """features: {feature_id: dict(feature_type, title, year, parent_feature_id, parent_title)}
-    subs: list of dict(subtitle_id, feature_id, language, file_id, download_count, srt)"""
+    subs: list of dict(subtitle_id, feature_id, language, file_id, download_count, srt)
+    refuse: which /subtitles searches answer HTTP 400 "Not enough parameters" (the real API refuses
+    a search by language alone): None, "language" (needs a year or an id), or "broad" (needs an id)."""
 
-    def __init__(self, features: dict, subs: list[dict], quota: int = 100, per_page: int = 2):
+    def __init__(self, features: dict, subs: list[dict], quota: int = 100, per_page: int = 2,
+                 refuse: str | None = None):
+        self.refuse = refuse
         self.features = features
         self.subs = subs
         self.remaining = quota
@@ -99,10 +103,20 @@ class FakeOpenSubtitles:
             return _Resp(200, {"data": {"allowed_downloads": 1000, "remaining_downloads": self.remaining,
                                         "vip": True}})
         if path == "/subtitles":
+            has_id = {"id", "imdb_id", "parent_imdb_id"} & set(q)
+            if (self.refuse == "language" and not has_id and "year" not in q) or (self.refuse == "broad" and not has_id):
+                return _Resp(400, {"errors": ["Not enough parameters"], "status": 400})
             langs = set(q["languages"].split(","))
             rows = [s for s in self.subs if s["language"] in langs]
             if "id" in q:
                 rows = [s for s in rows if str(s["feature_id"]) == q["id"]]
+            if "imdb_id" in q:  # the fake's IMDb id of a feature is feature_id * 10
+                rows = [s for s in rows if str(s["feature_id"] * 10) == q["imdb_id"]]
+            if "parent_imdb_id" in q:
+                rows = [s for s in rows
+                        if str((self.features[s["feature_id"]].get("parent_feature_id") or 0) * 10) == q["parent_imdb_id"]]
+            if "year" in q:
+                rows = [s for s in rows if str(self.features[s["feature_id"]].get("year", 2000)) == q["year"]]
             if "type" in q:
                 rows = [s for s in rows if self.features[s["feature_id"]]["feature_type"] == q["type"]]
             page = int(q.get("page", 1))

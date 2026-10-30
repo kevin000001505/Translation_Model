@@ -7,7 +7,7 @@ import pytest
 from subtune.catalog import Catalog
 from subtune.config import OpenSubtitlesSettings, Paths
 from subtune.dataset import build_dataset
-from subtune.listing import build_listing
+from subtune.listing import build_listing, listing_status
 from subtune.opensubtitles import OpenSubtitlesClient
 from subtune.prepare import prepare
 from subtune.selection import readiness, titles_table
@@ -17,7 +17,7 @@ from fake_api import FakeOpenSubtitles, chinese, english, make_srt
 N = 60
 
 
-def _world(quota: int):
+def _world(quota: int, refuse: str | None = None):
     features = {
         1: {"feature_type": "movie", "title": "Alpha", "year": 2001},
         2: {"feature_type": "movie", "title": "Beta (English only)", "year": 2002},
@@ -44,13 +44,13 @@ def _world(quota: int):
     # English has more subtitles than Chinese, so Chinese is scanned in full.
     for fid in (1, 2):
         add(fid, "en", 1, make_srt(english(N)))
-    return FakeOpenSubtitles(features, subs, quota=quota)
+    return FakeOpenSubtitles(features, subs, quota=quota, refuse=refuse)
 
 
 @pytest.fixture
 def env(tmp_path):
-    def make(quota=100):
-        fake = _world(quota)
+    def make(quota=100, refuse=None):
+        fake = _world(quota, refuse)
         settings = OpenSubtitlesSettings("key", "user", "pw", "subtune-test v0", rate_limit=1000)
         client = OpenSubtitlesClient(settings, session=fake, sleep=lambda s: None)
         paths = Paths(tmp_path / "data", tmp_path / "out").ensure()
@@ -120,3 +120,25 @@ def test_dataset_holds_out_whole_titles(env, tmp_path):
 
     info = build_dataset(cat, "en", "zh-tw", members, tmp_path / "run2", max_pairs=10)
     assert info.train_pairs == 10
+
+
+@pytest.mark.parametrize("refuse", ["language", "broad"])
+def test_listing_works_when_the_api_refuses_broad_searches(env, monkeypatch, tmp_path, refuse):
+    """The real API answers 'Not enough parameters' to a search by language alone."""
+    from subtune import imdb
+
+    monkeypatch.setenv("SUBTUNE_DATA_DIR", str(tmp_path / "data"))
+    # IMDb candidates of the fake world, most votes first: movies by IMDb id, the show by its parent id
+    monkeypatch.setattr(imdb, "candidates", lambda data_dir, threshold, log=print: [
+        [10, "movie", 900, "Alpha", 2001], [1000, "series", 800, "Show", 2000], [20, "movie", 700, "Beta", 2002],
+        [30, "movie", 600, "Gamma", 2003], [40, "movie", 500, "Delta", 2004]])
+    fake, client, cat, paths = env(refuse=refuse)
+    messages = []
+    build_listing(client, cat, "en", "zh-tw", progress=messages.append)
+    df, members = titles_table(cat, "en", "zh-tw")
+    assert list(df["Title"]) == ["Alpha", "Show", "Delta"]
+    assert members["series:100"] == [10, 11]
+    mode = "year by year" if refuse == "language" else "by IMDb id"
+    assert any(mode in m for m in messages)
+    assert cat.get_lang_scan("zh-tw")["status"] == "done"
+    assert "Not scanned" not in listing_status(cat, "en", "zh-tw")

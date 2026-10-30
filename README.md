@@ -106,11 +106,22 @@ subtune check-qlora
 
 ## How the movie list is built
 
-The OpenSubtitles API can't search for "has subtitles in both A and B". So the app pages through
-every subtitle in the rarer language (free, no quota), then checks each of those titles for the
-other language (one search per title). Both steps are cached and resume where they stopped. Expect
-one search per title at the default 5 requests/second the first time; the scan of a language is
-reused by every pair that includes it. Tick **Rescan for new subtitles** to pick up new uploads.
+The OpenSubtitles API can't search for "has subtitles in both A and B", and it refuses a search by
+language alone ("Not enough parameters"). So the app first collects the titles that have subtitles
+in the rarer language, then checks each of them for the other language (one search per title).
+Searches cost no download quota. For the first step it uses the broadest search the API accepts:
+
+1. language + year, one year at a time: covers the whole catalog;
+2. if that is refused too, language + IMDb id for every movie and series on IMDb with at least
+   1000 votes (about 65,000 titles), most-voted first. Set `SUBTUNE_IMDB_MIN_VOTES` in `.env` to
+   go wider or narrower. IMDb's free title lists (about 240 MB, refreshed monthly) are downloaded
+   to `data/imdb/` on first use.
+
+At the default 5 requests/second, an IMDb-based first scan takes a few hours. It runs in the
+background, resumes where it stopped, and the most-watched titles come first: click **Reload
+table** at any time to see what it has found so far. Everything is cached, and the scan of a
+language is reused by every pair that includes it. Tick **Rescan for new subtitles** to pick up
+new uploads.
 
 ## Quota
 
