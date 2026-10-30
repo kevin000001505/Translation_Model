@@ -18,6 +18,7 @@ from .config import PROJECT_ROOT, OpenSubtitlesSettings, get_paths, modal_config
 from .jobs import JobManager
 from .listing import listing_status
 from .opensubtitles import OpenSubtitlesClient, OpenSubtitlesError
+from .gguf_export import EXPORT_TYPES
 from .registry import list_models
 from .runconfig import TrainConfig
 from .selection import TABLE_COLUMNS, readiness, titles_table
@@ -247,7 +248,7 @@ def _check_qlora_local() -> tuple[bool, str]:
 
 
 def _build_config(src, tgt, selected, members, model_label, custom_id, gguf_file, method, target, gpu, max_hours,
-                  epochs, max_pairs, lr, lora_r, lora_alpha, batch_size, grad_accum, max_seq_len,
+                  epochs, max_pairs, gguf_export, lr, lora_r, lora_alpha, batch_size, grad_accum, max_seq_len,
                   eval_sentences) -> TrainConfig:
     spec = _spec(model_label, custom_id, gguf_file)
     return TrainConfig(
@@ -257,11 +258,14 @@ def _build_config(src, tgt, selected, members, model_label, custom_id, gguf_file
         epochs=float(epochs), max_pairs=int(max_pairs or 0), learning_rate=float(lr), lora_r=int(lora_r),
         lora_alpha=int(lora_alpha), batch_size=int(batch_size), grad_accum=int(grad_accum),
         max_seq_len=int(max_seq_len), eval_sentences=int(eval_sentences),
+        gguf_export="" if gguf_export == NO_EXPORT else gguf_export,
         titles={k: members.get(k, []) for k in selected},
     )
 
 
 HIDE = gr.update(visible=False)
+NO_EXPORT = "No GGUF export"
+EXPORT_CHOICES = list(EXPORT_TYPES)  # Q4_K_M, Q8_0, F16, BF16
 
 
 def start_training(*inputs):
@@ -278,6 +282,10 @@ def start_training(*inputs):
             return (msg, *no_choice)
     if target == models.TARGETS[1] and not modal_configured():
         return ("Set MODAL_TOKEN_ID and MODAL_TOKEN_SECRET in .env first.", *no_choice)
+    cfg = _build_config(*inputs)
+    if cfg.method == "Full" and cfg.gguf_file and cfg.gguf_export:
+        return ("GGUF export of a *full* fine-tune of a GGUF base model is not supported (its tokenizer would "
+                "have to be rebuilt). Use LoRA or QLoRA, or choose 'No GGUF export'.", *no_choice)
     if target == models.TARGETS[0] and method == "QLoRA":
         ok, msg = _check_qlora_local()
         if not ok:
@@ -418,6 +426,8 @@ def build_ui() -> gr.Blocks:
             with gr.Row():
                 epochs = gr.Number(value=d["epochs"], label="Epochs", minimum=0.1, step=0.5)
                 max_pairs = gr.Number(value=0, label="Max training pairs (0 = all)", minimum=0, precision=0)
+                gguf_export = gr.Dropdown([NO_EXPORT, *EXPORT_CHOICES], value="Q4_K_M",
+                                          label="Also export as GGUF (llama.cpp / Ollama / LM Studio)")
             with gr.Accordion("Advanced", open=False):
                 with gr.Row():
                     lr = gr.Number(value=d["learning_rate"], label="Learning rate")
@@ -481,7 +491,8 @@ def build_ui() -> gr.Blocks:
         gguf_dd.input(estimate_text, model_inputs, estimate_md)
 
         train_inputs = [src, tgt, st_selected, st_members, model_dd, custom_id, gguf_dd, method, target, gpu, max_hours,
-                        epochs, max_pairs, lr, lora_r, lora_alpha, batch_size, grad_accum, max_seq_len, eval_sentences]
+                        epochs, max_pairs, gguf_export, lr, lora_r, lora_alpha, batch_size, grad_accum, max_seq_len,
+                        eval_sentences]
         start_btn.click(start_training, train_inputs,
                         [train_msg, choice_box, choice_md, train_now_btn, dl_only_btn, dl_train_btn])
         train_now_btn.click(train_ready_now, train_inputs, [train_msg, choice_box])

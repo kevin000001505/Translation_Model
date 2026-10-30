@@ -19,6 +19,7 @@ class TrainConfig:
     max_hours: float = 8  # Modal hard time limit: the GPU is stopped (and billing ends) by then at the latest
     trust_remote_code: bool = False
     gguf_file: str = ""  # train from this GGUF file in model_id (converted to bf16 first)
+    gguf_export: str = ""  # also export the fine-tuned model as GGUF: "", Q4_K_M, Q8_0, F16 or BF16
     epochs: float = 1
     max_pairs: int = 0  # 0 = all
     learning_rate: float = 2e-4

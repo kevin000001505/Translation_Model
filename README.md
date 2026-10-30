@@ -45,6 +45,8 @@ Files the container writes to `./data` and `./outputs` are owned by root.
    The base model and the fine-tuned model are both scored (chrF and BLEU) on held-out titles.
 4. **Tag:** the result is saved as `outputs/models/<model>__<src>-<tgt>__<method>__<date>/` with a
    `metadata.json` and a model card. The Models tab lists every tag with its scores.
+5. **GGUF export (optional):** the fine-tuned model is also written as a `.gguf` file (Q4_K_M by
+   default) for llama.cpp, Ollama and LM Studio.
 
 ## Setup without Docker
 
@@ -150,6 +152,24 @@ Training-memory estimates are shown in the app. On the 32 GB R9700, LoRA fits th
 Qwen3 14B and TranslateGemma 27B need QLoRA or a Modal GPU. QLoRA on ROCm depends on bitsandbytes support for the
 card; the app checks it before starting and suggests Modal if it doesn't work.
 
+## Exporting to GGUF
+
+Pick a type under **Also export as GGUF** on the Train tab: Q4_K_M (the usual choice for Ollama and
+LM Studio), Q8_0, F16 or BF16. After training, the file is written to
+`outputs/models/<tag>/gguf/<tag>.<type>.gguf`, and the Models tab shows it.
+
+- Base model from a regular Hugging Face repo: the LoRA adapter is merged into the bf16 base model,
+  then llama.cpp's `convert_hf_to_gguf.py` writes the GGUF with the chat template embedded.
+- Base model from a GGUF (TranslateGemma): the adapter is converted with `convert_lora_to_gguf.py`
+  and merged into the *original* GGUF with `llama-export-lora`, so the file keeps the original
+  tokenizer exactly. A full fine-tune of a GGUF base can't be exported; use LoRA or QLoRA.
+
+The merge needs RAM for the whole bf16 model (about 2 GB per billion parameters); on Modal the app
+reserves it. llama.cpp is pinned to release `b11989`. The Docker and Modal images include it
+prebuilt; without Docker, the app clones and builds it on first use (needs git, cmake and a C++
+compiler, a few minutes). If an export fails, the fine-tuned model is still saved and the error is
+shown in the Models tab.
+
 ## Cloud costs (Modal)
 
 The GPU is billed per second while a job runs. A job is shut down:
@@ -173,8 +193,9 @@ data/subtitles/<lang>/   downloaded .srt files, one per OpenSubtitles file id
 data/pairs/<src>__<tgt>/ aligned sentence pairs per movie/episode (JSONL)
 data/runs/               per-run datasets, configs and checkpoints
 data/gguf-converted/     GGUF models converted to bf16 checkpoints (reused across runs)
+data/tools/              llama.cpp checkout and tools for GGUF export (without Docker)
 data/logs/               logs of jobs started from the app
-outputs/models/<tag>/    fine-tuned weights + metadata.json + README.md (model card)
+outputs/models/<tag>/    fine-tuned weights + metadata.json + README.md (model card) + gguf/ export
 ```
 
 ## Tests

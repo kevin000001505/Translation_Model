@@ -94,6 +94,12 @@ def test_gguf_runs_reserve_ram_for_conversion(fake, tmp_path):
     assert f.options["memory"] >= 27 * 2 * 1024  # bf16 copy of 27B parameters
 
 
+def test_gguf_export_reserves_ram_for_the_merge(fake, tmp_path):
+    f = fake()
+    modal_app.run_on_modal(_cfg(gguf_export="Q4_K_M"), tmp_path / "run1", "t", tmp_path / "out", lambda m: None)
+    assert f.options["memory"] >= 4 * 2 * 1024  # bf16 copy of Qwen3 4B
+
+
 def test_time_limit_is_clamped_to_modal_maximum(fake, tmp_path):
     f = fake()
     modal_app.run_on_modal(_cfg(max_hours=100), tmp_path / "run1", "t", tmp_path / "out", lambda m: None)

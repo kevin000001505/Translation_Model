@@ -21,6 +21,8 @@ from typing import Callable
 
 import modal
 
+from .gguf_export import LLAMA_CPP_REPO, LLAMA_CPP_TAG, LLAMA_CPP_TOOLS
+
 APP_NAME = "subtune"
 VOLUME_ROOT = "/vol"
 
@@ -30,6 +32,14 @@ hf_cache = modal.Volume.from_name("subtune-hf-cache", create_if_missing=True)
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
+    # llama.cpp for exporting fine-tuned models to GGUF (converters + tools), built once per image.
+    .apt_install("git", "cmake", "build-essential")
+    .run_commands(
+        f"git clone -q --depth 1 --branch {LLAMA_CPP_TAG} {LLAMA_CPP_REPO} /opt/llama.cpp",
+        "cmake -S /opt/llama.cpp -B /opt/llama.cpp/build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF "
+        "-DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF",
+        f"cmake --build /opt/llama.cpp/build --target {' '.join(LLAMA_CPP_TOOLS)} -j 8",
+    )
     .pip_install(
         "torch==2.8.0",
         "transformers>=5.6",
@@ -44,7 +54,8 @@ image = (
         "numpy",
     )
     # Converted GGUF models live on the cache volume, so a GGUF is converted only once.
-    .env({"HF_HOME": "/hf-cache", "HF_HUB_ENABLE_HF_TRANSFER": "0", "SUBTUNE_GGUF_CACHE": "/hf-cache/gguf-converted"})
+    .env({"HF_HOME": "/hf-cache", "HF_HUB_ENABLE_HF_TRANSFER": "0", "SUBTUNE_GGUF_CACHE": "/hf-cache/gguf-converted",
+          "SUBTUNE_LLAMA_CPP": "/opt/llama.cpp"})
     .add_local_python_source("subtune")
 )
 
@@ -69,9 +80,10 @@ def train_remote(cfg_dict: dict, run_name: str, tag: str) -> dict:
 
 
 def _memory_mib(cfg) -> int | None:
-    """RAM to reserve for GGUF runs, whose one-time conversion holds the whole bf16 model in memory.
-    Other runs keep Modal's default (memory is billed by the amount reserved)."""
-    if not cfg.gguf_file:
+    """RAM to reserve when a run holds the whole bf16 model in CPU memory: converting a GGUF base
+    model, or merging the adapter for a GGUF export. Other runs keep Modal's default (memory is
+    billed by the amount reserved)."""
+    if not (cfg.gguf_file or cfg.gguf_export):
         return None
     from .models import by_id
 

@@ -48,6 +48,7 @@ def write_metadata(out_dir: Path, tag: str, cfg: TrainConfig, data: dict, metric
         "train_seconds": metrics.get("train_seconds"),
         "prompt_family": metrics.get("prompt_family", cfg.family),
         "weights": "adapter" if cfg.method != "Full" else "model",
+        "gguf": metrics.get("gguf"),  # {"type", "file"} or {"type", "error"}; None when not exported
     }
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "metadata.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -88,6 +89,7 @@ def model_card(meta: dict) -> str:
         "",
         f"Scored on {tuned.get('n', 0)} held-out sentences from titles not used in training.",
         "",
+        *_gguf_section(meta),
         "## Data",
         "",
         "```json",
@@ -102,6 +104,26 @@ def model_card(meta: dict) -> str:
         "",
     ]
     return "\n".join(lines)
+
+
+def _gguf_section(meta: dict) -> list[str]:
+    gguf = meta.get("gguf")
+    if not gguf or not gguf.get("file"):
+        return []
+    return [
+        "## GGUF",
+        "",
+        f"`{gguf['file']}` ({gguf['type']}) loads in llama.cpp, Ollama and LM Studio, with the base model's "
+        f"chat template embedded. Prompt it the way it was fine-tuned (subtune prompt family "
+        f"`{meta['prompt_family']}`): one subtitle line per request.",
+        "",
+    ]
+
+
+def _gguf_cell(gguf: dict | None) -> str:
+    if not gguf:
+        return ""
+    return gguf["type"] if gguf.get("file") else f"{gguf['type']} (failed)"
 
 
 def list_models(models_dir: Path) -> pd.DataFrame:
@@ -121,6 +143,7 @@ def list_models(models_dir: Path) -> pd.DataFrame:
             "Pairs": m["data"].get("train_pairs"),
             "chrF base → tuned": f"{base.get('chrf', '–')} → {tuned.get('chrf', '–')}",
             "BLEU base → tuned": f"{base.get('bleu', '–')} → {tuned.get('bleu', '–')}",
+            "GGUF": _gguf_cell(m.get("gguf")),
             "Trained on": m.get("trained_on"),
             "Created": m.get("created"),
         })

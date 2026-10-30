@@ -6,6 +6,7 @@ Runs the same way on the local ROCm GPU and inside a Modal container: reads
 
 from __future__ import annotations
 
+import gc
 import json
 import math
 import os
@@ -74,7 +75,7 @@ def load_model(cfg: TrainConfig, log: Log):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     log(f"Loaded {cfg.model_id} ({sum(p.numel() for p in model.parameters()) / 1e9:.2f}B params, {cfg.method}).")
-    return model, tokenizer
+    return model, tokenizer, source
 
 
 # Attention and MLP projections (the usual LoRA targets for Llama/Qwen/Mistral-style models).
@@ -179,7 +180,7 @@ def run_training(cfg: TrainConfig, run_dir: Path, out_dir: Path, log: Log = prin
     log(f"Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}; "
         f"{len(train_rows)} training pairs, {len(eval_rows)} evaluation sentences.")
 
-    model, tokenizer = load_model(cfg, log)
+    model, tokenizer, source = load_model(cfg, log)
     family = resolve_family(cfg.family, tokenizer)
 
     base_scores = evaluate_model(model, tokenizer, family, cfg, eval_rows, log, "Base model")
@@ -238,7 +239,7 @@ def run_training(cfg: TrainConfig, run_dir: Path, out_dir: Path, log: Log = prin
     model.save_pretrained(weights_dir)
     tokenizer.save_pretrained(weights_dir)
     log(f"Saved weights to {weights_dir}")
-    return {
+    metrics = {
         "base": base_scores,
         "tuned": tuned_scores,
         "train_loss": result.training_loss,
@@ -247,3 +248,23 @@ def run_training(cfg: TrainConfig, run_dir: Path, out_dir: Path, log: Log = prin
         "prompt_family": family,
         "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
     }
+    if cfg.gguf_export:
+        del trainer, model
+        gc.collect()
+        torch.cuda.empty_cache()
+        from .gguf_export import export_gguf
+
+        try:
+            base_gguf = None
+            if cfg.gguf_file:  # merge into the original GGUF, keeping its tokenizer (already in the HF cache)
+                from huggingface_hub import hf_hub_download
+
+                token = os.environ.get("HF_TOKEN") or None
+                base_gguf = Path(hf_hub_download(cfg.model_id, cfg.gguf_file, token=token))
+            path = export_gguf(cfg.gguf_export, source, weights_dir, cfg.method != "Full", out_dir,
+                               run_dir / "gguf-work", cfg.trust_remote_code, log, base_gguf=base_gguf)
+            metrics["gguf"] = {"type": cfg.gguf_export, "file": str(path.relative_to(out_dir))}
+        except Exception as exc:  # the fine-tune itself is fine; report the export problem and keep it
+            log(f"GGUF export failed: {exc}")
+            metrics["gguf"] = {"type": cfg.gguf_export, "error": str(exc)}
+    return metrics
