@@ -4,6 +4,7 @@ import signal
 import subprocess
 import sys
 import textwrap
+import time
 import types
 from contextlib import contextmanager
 from pathlib import Path
@@ -14,9 +15,25 @@ modal_app = pytest.importorskip("subtune.modal_app")
 from subtune.runconfig import TrainConfig  # noqa: E402
 
 
+class FakeQueue:
+    def __init__(self):
+        self.items = []
+
+    def put(self, v):
+        self.items.append(v)
+
+    def get_many(self, n, block=True, timeout=None):
+        if not self.items and block:
+            time.sleep(min(timeout or 0, 0.05))
+        out, self.items = self.items[:n], self.items[n:]
+        return out
+
+
 class FakeModal:
-    def __init__(self, fail: bool = False):
+    def __init__(self, fail: bool = False, quiet_for: float = 0):
         self.fail = fail
+        self.quiet_for = quiet_for
+        self.queue = FakeQueue()
         self.app_running = False
         self.options = {}
         self.removed = []
@@ -33,18 +50,24 @@ class FakeModal:
         self.options = kw
         return types.SimpleNamespace(remote=self.remote)
 
-    def remote(self, cfg, run_name, tag):
-        assert self.app_running
+    def remote(self, cfg, run_name, tag, log_queue):
+        assert self.app_running and log_queue is self.queue
+        time.sleep(self.quiet_for)  # e.g. the image build before the container logs anything
+        log_queue.put("Step 1/4: preparing the base model.")
         if self.fail:
+            log_queue.put("Traceback: CUDA out of memory")
             raise RuntimeError("CUDA out of memory")
+        log_queue.put("step 10/100 epoch 0.10 loss 1.2345 lr 2.00e-04")
         return {"tuned": {"chrf": 1.0}}
 
 
 @pytest.fixture
 def fake(monkeypatch, tmp_path):
-    def make(fail=False):
-        f = FakeModal(fail)
+    def make(fail=False, quiet_for=0):
+        f = FakeModal(fail, quiet_for)
         monkeypatch.setattr(modal_app.app, "run", f.run)
+        monkeypatch.setattr(modal_app.app, "get_dashboard_url", lambda: "https://modal.com/id/ap-test")
+        monkeypatch.setattr(modal_app.modal.Queue, "ephemeral", contextmanager(lambda: (yield f.queue)))
         monkeypatch.setattr(modal_app.train_remote, "with_options", f.with_options)
 
         @contextmanager
@@ -84,6 +107,24 @@ def test_failed_run_still_stops_app(fake, tmp_path):
         modal_app.run_on_modal(_cfg(), tmp_path / "run1", "t", tmp_path / "out", logs.append)
     assert not f.app_running
     assert any("cloud GPU is released" in m for m in logs)
+    assert "Traceback: CUDA out of memory" in logs  # the cloud side's last words still reach the log
+
+
+def test_cloud_training_log_reaches_the_local_log(fake, tmp_path):
+    fake()
+    logs = []
+    modal_app.run_on_modal(_cfg(), tmp_path / "run1", "t", tmp_path / "out", logs.append)
+    assert "Modal dashboard for this run: https://modal.com/id/ap-test" in logs
+    i, j = logs.index("Step 1/4: preparing the base model."), logs.index("step 10/100 epoch 0.10 loss 1.2345 lr 2.00e-04")
+    assert i < j < next(k for k, m in enumerate(logs) if "cloud GPU is released" in m)
+
+
+def test_quiet_cloud_job_is_reported(fake, tmp_path, monkeypatch):
+    monkeypatch.setattr(modal_app._relay, "QUIET_SECONDS", 0.1)
+    fake(quiet_for=0.5)
+    logs = []
+    modal_app.run_on_modal(_cfg(), tmp_path / "run1", "t", tmp_path / "out", logs.append)
+    assert any("cloud job starting (building the image / waiting for a GPU)" in m for m in logs)
 
 
 def test_gguf_runs_reserve_ram_for_conversion(fake, tmp_path):

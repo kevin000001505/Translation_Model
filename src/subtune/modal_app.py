@@ -16,6 +16,8 @@ stops as soon as this script exits, fails, or loses its connection. On top of th
 from __future__ import annotations
 
 import os
+import threading
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -67,13 +69,24 @@ image = (
     volumes={VOLUME_ROOT: volume, "/hf-cache": hf_cache},
     secrets=[modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN") or ""})],
 )
-def train_remote(cfg_dict: dict, run_name: str, tag: str) -> dict:
+def train_remote(cfg_dict: dict, run_name: str, tag: str, log_queue=None) -> dict:
     from subtune.runconfig import TrainConfig
     from subtune.train import run_training
 
+    def log(message: str) -> None:
+        # The training log goes back to the local job through the queue (shown in the app's
+        # Training log); without one, it goes to Modal's own log stream.
+        if log_queue is None:
+            print(message, flush=True)
+            return
+        try:
+            log_queue.put(message)
+        except Exception:
+            print(message, flush=True)
+
     run_dir = Path(VOLUME_ROOT) / "runs" / run_name
     out_dir = Path(VOLUME_ROOT) / "models" / tag
-    metrics = run_training(TrainConfig.from_dict(cfg_dict), run_dir, out_dir, lambda m: print(m, flush=True))
+    metrics = run_training(TrainConfig.from_dict(cfg_dict), run_dir, out_dir, log)
     volume.commit()
     hf_cache.commit()
     return metrics
@@ -92,6 +105,52 @@ def _memory_mib(cfg) -> int | None:
     return int((params_b * 3 + 8) * 1024)
 
 
+class _relay:
+    """Copy log lines from the cloud job's queue into the local log while the job runs, and say
+    so when the cloud side has been quiet for a while (image build, container start, downloads)."""
+
+    QUIET_SECONDS = 120
+
+    def __init__(self, queue, log: Callable[[str], None]):
+        self.queue, self.log = queue, log
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.start = self.last = time.time()
+        self.seen = False
+
+    def _drain(self, block: bool) -> None:
+        for line in self.queue.get_many(100, block=block, timeout=5 if block else None):
+            self.log(str(line))
+            self.last, self.seen = time.time(), True
+
+    def _run(self) -> None:
+        while not self.stop.is_set():
+            try:
+                self._drain(block=True)
+            except Exception as exc:  # keep relaying; a transient queue error must not end the job
+                self.log(f"(could not read cloud log: {exc})")
+                self.stop.wait(5)
+            quiet = time.time() - self.last
+            if quiet >= self.QUIET_SECONDS:
+                state = "running" if self.seen else "starting (building the image / waiting for a GPU)"
+                self.log(f"... cloud job {state}, no new log for {quiet / 60:.0f} min "
+                         f"({(time.time() - self.start) / 60:.0f} min in total)")
+                self.last = time.time()
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop.set()
+        self.thread.join(timeout=15)
+        try:
+            self._drain(block=False)  # lines sent just before the job returned
+        except Exception:
+            pass
+        return False
+
+
 def run_on_modal(cfg, run_dir: Path, tag: str, out_dir: Path, log: Callable[[str], None]) -> dict:
     run_name = run_dir.name
     log(f"Uploading dataset to Modal volume 'subtune' (runs/{run_name}).")
@@ -101,9 +160,16 @@ def run_on_modal(cfg, run_dir: Path, tag: str, out_dir: Path, log: Callable[[str
     timeout = max(60, min(int(cfg.max_hours * 3600), 24 * 3600))  # Modal allows up to 24 h
     log(f"Starting Modal job on {cfg.gpu}, hard time limit {timeout / 3600:.1f} h. Container logs follow.")
     try:
-        with modal.enable_output(), app.run():
+        # enable_output streams image builds, warnings and tracebacks; the training log itself
+        # comes back through the queue, so it shows up in the job log line by line.
+        with modal.enable_output(), app.run(), modal.Queue.ephemeral() as log_queue:
+            try:
+                log(f"Modal dashboard for this run: {app.get_dashboard_url()}")
+            except Exception:
+                pass
             fn = train_remote.with_options(gpu=cfg.gpu, timeout=timeout, memory=_memory_mib(cfg))
-            metrics = fn.remote(cfg.to_dict(), run_name, tag)
+            with _relay(log_queue, log):
+                metrics = fn.remote(cfg.to_dict(), run_name, tag, log_queue)
     finally:
         # Leaving app.run() stops the ephemeral app and every container in it, also on errors and on
         # Stop (SIGTERM is turned into SystemExit by the CLI), so no GPU keeps running.
