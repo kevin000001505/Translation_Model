@@ -42,11 +42,15 @@ Files the container writes to `./data` and `./outputs` are owned by root.
    (the most downloaded human translation) and aligns the two by timestamp. Each file is downloaded
    once and kept, so later runs on other models cost no quota.
 3. **Train:** LoRA, QLoRA or full fine-tuning, on the local AMD R9700 (ROCm) or a Modal cloud GPU.
-   The base model and the fine-tuned model are both scored (chrF and BLEU) on held-out titles.
+   The base model and the fine-tuned model are both scored (chrF and BLEU) on held-out titles, and
+   the validation loss is tracked during training (see *Validation report*).
 4. **Tag:** the result is saved as `outputs/models/<model>__<src>-<tgt>__<method>__<date>/` with a
    `metadata.json` and a model card. The Models tab lists every tag with its scores.
 5. **GGUF export (optional):** the fine-tuned model is also written as a `.gguf` file (Q4_K_M by
    default) for llama.cpp, Ollama and LM Studio.
+6. **Publish (optional):** the GGUF is uploaded to a private repo on your Hugging Face account and
+   deployed with [llm-model-manager](https://github.com/kevin000001505/llm-model-manager), so any
+   machine can call it through llama-swap's OpenAI-compatible API.
 
 ## Setup without Docker
 
@@ -138,7 +142,8 @@ All of these are public and ungated on Hugging Face (no token, no access request
 
 | Model | Notes |
 |---|---|
-| TranslateGemma 4B / 12B / 27B (GGUF) | Ungated GGUF copies by mradermacher (f16 for 4B, Q8_0 for 12B/27B). Gemma Terms of Use apply. |
+| TranslateGemma 4B / 12B / 27B | Original bf16 weights from Infomaniak-AI's ungated copies. Gemma Terms of Use apply. |
+| TranslateGemma 4B / 12B / 27B (GGUF) | Ungated GGUF copies by mradermacher (f16 for 4B, Q8_0 for 12B/27B); converted before training. |
 | Hy-MT2 7B | Apache-2.0. Tencent's translation model; uses its documented prompts. |
 | Hunyuan-MT 7B | Tencent Hunyuan Community License (check its territory restrictions). |
 | Seed-X PPO 7B | OpenMDW license. Raw prompt ending in a target-language tag. |
@@ -146,7 +151,12 @@ All of these are public and ungated on Hugging Face (no token, no access request
 | Custom | Any public causal LM or GGUF repo. The app checks Hugging Face and refuses gated or private models. |
 
 Google's own TranslateGemma repos are gated (they require an access request), so the app uses
-community GGUF copies of the same weights, which download freely.
+community copies of the same weights, which download freely. Prefer the non-GGUF entries: they are
+the original weights and tokenizer, need no conversion, and export cleanly to GGUF.
+
+Gemma 3 4B/12B/27B scale RoPE linearly (×8) on their full-attention layers. Transformers loses that
+setting both when converting a GGUF and when reading the vLLM-style config of the Infomaniak copies,
+so the app puts it back before training and before exporting.
 
 ### GGUF models
 
@@ -182,6 +192,53 @@ reserves it. llama.cpp is pinned to release `b11989`. The Docker and Modal image
 prebuilt; without Docker, the app clones and builds it on first use (needs git, cmake and a C++
 compiler, a few minutes). If an export fails, the fine-tuned model is still saved and the error is
 shown in the Models tab.
+
+The exported GGUF gets a plain-text chat template: it wraps the user message in exactly the prompt
+used for fine-tuning, so a client sends only the text to translate, e.g.
+`{"role": "user", "content": "Where are you going?"}`, and gets the translation back.
+
+## Publishing to llm-model-manager
+
+Tick **Upload the GGUF to my Hugging Face (private repo) and deploy it with llm-model-manager** on
+the Train tab (it needs a GGUF export type). After training, the app:
+
+1. creates the private repo `<your HF user>/<tag>-GGUF` and uploads the GGUF and model card
+   (needs `HF_TOKEN` with **write** access);
+2. calls llm-model-manager's `POST /api/setup` (`LLM_MANAGER_URL`), which downloads the repo with its
+   own `HF_TOKEN` (it must be able to read your private repos) and adds it to llama-swap.
+
+The model is then served as `<tag with "__" → "_">-<type>`, shown in the Models tab under *Serving
+as*. From any machine:
+
+```bash
+curl http://<llama-swap host>:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model": "translategemma-12b_en-zh-TW_lora_2026-10-30-Q4_K_M", "messages": [{"role": "user", "content": "Where are you going?"}], "temperature": 0}'
+```
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LLM_MANAGER_URL` | *(required to deploy)* | e.g. `http://192.168.1.10:8000` |
+| `LLM_MANAGER_GPU` | `all` | a `GPUS` name from the manager's `.env`, e.g. `r9700` |
+| `LLM_MANAGER_PARAMS` | `{"c": 4096}` | llama-server parameters (JSON) for the deployed config |
+| `SUBTUNE_HF_NAMESPACE` | your HF user | HF user or organisation that owns the repos |
+| `LLAMA_SWAP_URL` | – | only used to write the example call into the model card |
+
+If the upload or the deploy fails, the fine-tuned model is still saved locally and the error is
+recorded in `metadata.json`.
+
+## Validation report
+
+About 1% of the pairs, from titles not used for training, are held out. For every run:
+
+- validation loss is measured before training, about ten times during it, and after it;
+- the base and fine-tuned models translate every held-out sentence and are scored (chrF, BLEU, and
+  chrF per sentence);
+- `outputs/models/<tag>/validation.jsonl` keeps each sentence with both translations and scores.
+
+The Models tab shows, for the selected tag, the score change, a loss chart (training and
+validation), a base-vs-fine-tuned score chart, and the sentences sorted by how much they improved.
+The log warns when the fine-tuned model translates every sentence exactly like the base model, or
+when the LoRA weights never moved: both mean the fine-tune had no effect.
 
 ## Cloud costs (Modal)
 

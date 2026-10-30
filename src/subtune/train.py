@@ -16,9 +16,9 @@ from typing import Callable
 
 import torch
 
-from .evaluate import score
+from .evaluate import compare, score
 from .progress import heartbeat
-from .prompts import encode, end_marker, resolve_family
+from .prompts import encode, end_marker, plain_text_template, resolve_family
 from .runconfig import TrainConfig
 
 Log = Callable[[str], None]
@@ -45,7 +45,9 @@ def qlora_supported() -> tuple[bool, str]:
 
 
 def load_model(cfg: TrainConfig, log: Log):
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+    from .gemma3 import fix_rope
 
     token = os.environ.get("HF_TOKEN") or None
     source = cfg.model_id
@@ -54,7 +56,11 @@ def load_model(cfg: TrainConfig, log: Log):
 
         source = str(ensure_converted(cfg.model_id, cfg.gguf_file, log))
     tokenizer = AutoTokenizer.from_pretrained(source, token=token, trust_remote_code=cfg.trust_remote_code)
-    kwargs = {"token": token, "trust_remote_code": cfg.trust_remote_code, "dtype": torch.bfloat16}
+    config = AutoConfig.from_pretrained(source, token=token, trust_remote_code=cfg.trust_remote_code)
+    if fix_rope(config):
+        log("Restored Gemma 3's linear RoPE scaling on the full-attention layers (lost in this copy's config).")
+    kwargs = {"token": token, "trust_remote_code": cfg.trust_remote_code, "dtype": torch.bfloat16,
+              "config": config}
     if torch.cuda.is_available():
         kwargs["device_map"] = {"": 0}
     if cfg.method == "QLoRA":
@@ -80,8 +86,9 @@ def load_model(cfg: TrainConfig, log: Log):
     return model, tokenizer, source
 
 
-# Attention and MLP projections (the usual LoRA targets for Llama/Qwen/Mistral-style models).
-LORA_TARGETS = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+# Attention and MLP projections of the language model (the usual LoRA targets); the regex leaves out
+# a vision tower, which multimodal checkpoints such as TranslateGemma load alongside it.
+LORA_TARGETS = r"^(?!.*(vision|multi_modal_projector)).*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)$"
 
 
 def add_adapters(model, cfg: TrainConfig, log: Log):
@@ -170,7 +177,19 @@ def evaluate_model(model, tokenizer, family: str, cfg: TrainConfig, rows: list[d
     log(f"{label}: chrF {result['chrf']:.2f}, BLEU {result['bleu']:.2f} on {len(rows)} sentences "
         f"({time.time() - t0:.0f}s).")
     result["samples"] = [{"src": r["src"], "ref": r["tgt"], "hyp": h} for r, h in list(zip(rows, hyps))[:5]]
+    result["hyps"] = hyps  # every translation, for the per-sentence validation report
     return result
+
+
+def _check_adapter_moved(model, cfg: TrainConfig, log: Log) -> None:
+    """LoRA's B matrices start at zero: if they are still zero, training changed nothing."""
+    if cfg.method == "Full":
+        return
+    biggest = max((float(p.detach().abs().max()) for n, p in model.named_parameters() if "lora_B" in n),
+                  default=0.0)
+    log(f"Adapter check: largest LoRA B weight is {biggest:.2e}.")
+    if biggest == 0.0:
+        log("WARNING: the LoRA adapter weights are still zero, so training did not update them.")
 
 
 def run_training(cfg: TrainConfig, run_dir: Path, out_dir: Path, log: Log = print) -> dict:
@@ -197,12 +216,22 @@ def run_training(cfg: TrainConfig, run_dir: Path, out_dir: Path, log: Log = prin
     data = _Examples(train_rows, tokenizer, family, cfg, log)
     if not len(data):
         raise ValueError("No training examples after tokenization.")
+    eval_data = _Examples(eval_rows, tokenizer, family, cfg, log)
+    curves: dict[str, list] = {"train": [], "validation": []}  # [step, loss] points for the plots
 
     class _LogCallback(TrainerCallback):
         def on_log(self, args, state, control, logs=None, **kw):
             if logs and "loss" in logs:
+                curves["train"].append([state.global_step, round(float(logs["loss"]), 4)])
                 log(f"step {state.global_step}/{state.max_steps} epoch {logs.get('epoch', 0):.2f} "
                     f"loss {logs['loss']:.4f} lr {logs.get('learning_rate', 0):.2e}")
+            if logs and "eval_loss" in logs:
+                points = curves["validation"]
+                if points and points[-1][0] == state.global_step:
+                    return  # the final evaluation repeats the last scheduled one
+                points.append([state.global_step, round(float(logs["eval_loss"]), 4)])
+                if 0 < state.global_step < state.max_steps:  # before/after get their own log lines
+                    log(f"step {state.global_step}/{state.max_steps} validation loss {logs['eval_loss']:.4f}")
 
     bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     steps_per_epoch = math.ceil(len(data) / (cfg.batch_size * cfg.grad_accum))
@@ -216,6 +245,11 @@ def run_training(cfg: TrainConfig, run_dir: Path, out_dir: Path, log: Log = prin
         lr_scheduler_type="cosine",
         warmup_steps=max(1, int(0.03 * total_steps)),  # an int works on transformers 4.x and 5.x
         logging_steps=max(1, min(10, steps_per_epoch // 5)),
+        # Validation loss on the held-out titles about ten times per run, for the loss curves.
+        eval_strategy="steps" if len(eval_data) else "no",
+        eval_steps=max(1, total_steps // 10),
+        per_device_eval_batch_size=cfg.batch_size,
+        prediction_loss_only=True,
         save_strategy="steps",
         save_steps=500,
         save_total_limit=2,
@@ -229,14 +263,23 @@ def run_training(cfg: TrainConfig, run_dir: Path, out_dir: Path, log: Log = prin
         dataloader_num_workers=0,
         disable_tqdm=True,  # the log callback reports progress; tqdm bars clutter the job log
     )
-    trainer = Trainer(model=model, args=args, train_dataset=data,
+    trainer = Trainer(model=model, args=args, train_dataset=data, eval_dataset=eval_data if len(eval_data) else None,
                       data_collator=_collate(tokenizer.pad_token_id),
                       callbacks=[_LogCallback()])
+    loss_before = None
+    if len(eval_data):
+        with heartbeat(log, "measuring the validation loss"):
+            loss_before = float(trainer.evaluate()["eval_loss"])
+        log(f"Validation loss before training: {loss_before:.4f}")
     log(f"Step 3/{steps}: training ({math.ceil(total_steps)} steps; progress is logged every few steps).")
     t0 = time.time()
     result = trainer.train()
     train_seconds = time.time() - t0
     log(f"Training finished in {train_seconds / 60:.1f} min, final loss {result.training_loss:.4f}.")
+    loss_after = float(trainer.evaluate()["eval_loss"]) if len(eval_data) else None
+    if loss_after is not None:
+        log(f"Validation loss after training: {loss_after:.4f} (before: {loss_before:.4f})")
+    _check_adapter_moved(model, cfg, log)
 
     model.config.use_cache = True
     log(f"Step 4/{steps}: scoring the fine-tuned model and saving it.")
@@ -249,6 +292,19 @@ def run_training(cfg: TrainConfig, run_dir: Path, out_dir: Path, log: Log = prin
         model.save_pretrained(weights_dir)
         tokenizer.save_pretrained(weights_dir)
     log(f"Saved weights to {weights_dir}")
+    validation = {"loss_before": loss_before, "loss_after": loss_after}
+    if eval_rows and base_scores and tuned_scores:
+        details, summary = compare(eval_rows, base_scores.pop("hyps"), tuned_scores.pop("hyps"))
+        validation.update(summary)
+        with (out_dir / "validation.jsonl").open("w", encoding="utf-8") as f:
+            for d in details:
+                f.write(json.dumps(d, ensure_ascii=False) + "\n")
+        log(f"Validation: {summary['improved']} sentences better, {summary['worse']} worse, "
+            f"{summary['sentences'] - summary['changed']} unchanged of {summary['sentences']} "
+            "(details in validation.jsonl and on the Models tab).")
+        if summary["changed"] == 0:
+            log("WARNING: the fine-tuned model gave exactly the base model's translation for every validation "
+                "sentence, so the fine-tune had no effect. Check the training and validation losses above.")
     metrics = {
         "base": base_scores,
         "tuned": tuned_scores,
@@ -257,8 +313,15 @@ def run_training(cfg: TrainConfig, run_dir: Path, out_dir: Path, log: Log = prin
         "train_examples": len(data),
         "prompt_family": family,
         "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+        "validation": validation,
+        "curves": curves,
     }
     if cfg.gguf_export:
+        try:
+            api_template = plain_text_template(tokenizer, family, cfg.src, cfg.tgt)
+        except Exception as exc:  # the export then keeps the base model's own template
+            log(f"Could not build a plain-text chat template ({exc}); keeping the base model's.")
+            api_template = None
         del trainer, model
         gc.collect()
         torch.cuda.empty_cache()
@@ -274,8 +337,10 @@ def run_training(cfg: TrainConfig, run_dir: Path, out_dir: Path, log: Log = prin
             log(f"Step 5/{steps}: exporting a {cfg.gguf_export} GGUF.")
             with heartbeat(log, "exporting the GGUF"):
                 path = export_gguf(cfg.gguf_export, source, weights_dir, cfg.method != "Full", out_dir,
-                                   run_dir / "gguf-work", cfg.trust_remote_code, log, base_gguf=base_gguf)
-            metrics["gguf"] = {"type": cfg.gguf_export, "file": str(path.relative_to(out_dir))}
+                                   run_dir / "gguf-work", cfg.trust_remote_code, log, base_gguf=base_gguf,
+                                   chat_template=api_template)
+            metrics["gguf"] = {"type": cfg.gguf_export, "file": str(path.relative_to(out_dir)),
+                               "plain_text_template": api_template is not None}
         except Exception as exc:  # the fine-tune itself is fine; report the export problem and keep it
             log(f"GGUF export failed: {exc}")
             metrics["gguf"] = {"type": cfg.gguf_export, "error": str(exc)}

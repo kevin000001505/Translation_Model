@@ -25,6 +25,8 @@ def fake_llama(monkeypatch, tmp_path):
         for flag in ("--outfile", "-o"):
             if flag in cmd:
                 Path(cmd[cmd.index(flag) + 1]).write_bytes(b"gguf")
+        if Path(cmd[1]).name == "gguf_new_metadata.py":
+            Path(cmd[3]).write_bytes(b"gguf with new template")
         if Path(cmd[0]).name == "llama-quantize":
             positional = [a for a in cmd[1:] if not a.startswith("--")]
             Path(positional[1]).write_bytes(b"gguf")
@@ -117,3 +119,12 @@ def test_tools_are_built_once(fake_llama, tmp_path):
 def test_dockerfile_pins_the_same_llama_cpp_release():
     dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text()
     assert f"ARG LLAMA_CPP_TAG={gguf_export.LLAMA_CPP_TAG}" in dockerfile
+
+
+def test_plain_text_chat_template_is_written_into_the_export(fake_llama, tmp_path):
+    root, calls = fake_llama
+    out_dir = tmp_path / "models" / "my-tag"
+    path = gguf_export.export_gguf("Q8_0", "/src/model", tmp_path / "adapter", True, out_dir, tmp_path / "work",
+                                   False, lambda m: None, chat_template="{{ messages[0]['content'] }}")
+    assert _names(calls) == ["convert_hf_to_gguf.py", "gguf_new_metadata.py"]
+    assert "--chat-template-file" in calls[1] and path.read_bytes() == b"gguf with new template"

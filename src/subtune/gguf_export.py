@@ -86,10 +86,14 @@ def _merged_checkpoint(source: str, weights_dir: Path, work_dir: Path, trust_rem
     """Base model + LoRA adapter merged into one bf16 checkpoint (on CPU, to leave the GPU alone)."""
     import torch
     from peft import PeftModel
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+    from .gemma3 import fix_rope
 
     log("Merging the adapter into the bf16 base model...")
-    base = AutoModelForCausalLM.from_pretrained(source, dtype=torch.bfloat16, device_map={"": "cpu"},
+    config = AutoConfig.from_pretrained(source, trust_remote_code=trust_remote_code)
+    fix_rope(config)  # the GGUF converter reads RoPE scaling from this config
+    base = AutoModelForCausalLM.from_pretrained(source, config=config, dtype=torch.bfloat16, device_map={"": "cpu"},
                                                 trust_remote_code=trust_remote_code)
     merged = PeftModel.from_pretrained(base, weights_dir).merge_and_unload()
     shutil.rmtree(work_dir, ignore_errors=True)
@@ -128,12 +132,24 @@ def _from_gguf(kind: str, root: Path, base_gguf: Path, converted_dir: str, weigh
         _run([quantize, "--allow-requantize", merged, dest, kind], log)
 
 
+def _set_chat_template(root: Path, gguf: Path, template: str, work: Path, log: Log) -> None:
+    """Replace the GGUF's chat template (llama.cpp's gguf_new_metadata rewrites the file)."""
+    tpl = work / "chat_template.jinja"
+    tpl.write_text(template, encoding="utf-8")
+    tmp = gguf.with_name(gguf.name + ".tmp")
+    _run([sys.executable, root / "gguf-py" / "gguf" / "scripts" / "gguf_new_metadata.py", gguf, tmp,
+          "--chat-template-file", tpl, "--force"], log, _python_env(root))
+    tmp.replace(gguf)
+
+
 def export_gguf(kind: str, source: str, weights_dir: Path, is_adapter: bool, out_dir: Path, work: Path,
-                trust_remote_code: bool, log: Log, base_gguf: Path | None = None) -> Path:
+                trust_remote_code: bool, log: Log, base_gguf: Path | None = None,
+                chat_template: str | None = None) -> Path:
     """Write ``out_dir/gguf/<tag>.<kind>.gguf`` and return its path.
 
     ``source`` is the Hugging Face checkpoint training started from (for a GGUF base: its converted
-    folder); ``base_gguf`` is the original GGUF file when the base model came from one."""
+    folder); ``base_gguf`` is the original GGUF file when the base model came from one;
+    ``chat_template`` replaces the file's chat template (see prompts.plain_text_template)."""
     if kind not in EXPORT_TYPES:
         raise ValueError(f"Unknown GGUF type {kind}; choose one of {', '.join(EXPORT_TYPES)}")
     if base_gguf and not is_adapter:
@@ -148,6 +164,9 @@ def export_gguf(kind: str, source: str, weights_dir: Path, is_adapter: bool, out
             _from_gguf(kind, root, base_gguf, source, weights_dir, dest, work, log)
         else:
             _from_hf(kind, root, source, weights_dir, is_adapter, dest, work, trust_remote_code, log)
+        if chat_template:
+            log("Setting the plain-text chat template (send just the text to translate as the user message).")
+            _set_chat_template(root, dest, chat_template, work, log)
     finally:
         shutil.rmtree(work, ignore_errors=True)  # merged checkpoints and intermediates are large
     log(f"GGUF written: {dest} ({dest.stat().st_size / 1e9:.2f} GB)")

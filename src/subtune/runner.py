@@ -64,6 +64,15 @@ def run_job(cfg: TrainConfig, log: Log = print) -> str:
         "title_keys": sorted(cfg.titles),
     }
     meta = write_metadata(out_dir, tag, cfg, data, metrics)
+    if cfg.publish:
+        from .publish import publish
+        from .registry import save_metadata
+
+        if (meta.get("gguf") or {}).get("file"):
+            meta["published"] = publish(out_dir, meta, log)
+            save_metadata(out_dir, meta)
+        else:
+            log("Not publishing: there is no exported GGUF file (see the export step above).")
     base, tuned = meta["scores"]["base"] or {}, meta["scores"]["fine_tuned"] or {}
     log(f"DONE. Tag: {tag}")
     log(f"chrF {base.get('chrf')} → {tuned.get('chrf')}, BLEU {base.get('bleu')} → {tuned.get('bleu')}")

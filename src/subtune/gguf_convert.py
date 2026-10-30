@@ -62,7 +62,7 @@ def ensure_converted(repo: str, gguf_file: str, log: Callable[[str], None] = pri
         log(f"Using converted GGUF at {out}")
         return out
     token = os.environ.get("HF_TOKEN") or None
-    download_gguf(repo, gguf_file, log)
+    gguf_path = download_gguf(repo, gguf_file, log)
     log("Converting the GGUF to a bf16 checkpoint (one time; needs RAM for the whole model).")
     with heartbeat(log, "converting the GGUF"):
         tokenizer = AutoTokenizer.from_pretrained(repo, gguf_file=gguf_file, token=token)
@@ -70,6 +70,10 @@ def ensure_converted(repo: str, gguf_file: str, log: Callable[[str], None] = pri
             repo, gguf_file=gguf_file, token=token, dtype=torch.bfloat16,
             quantization_config=GgufConfig(gguf_file=gguf_file, dequantize=True),
         )
+    from .gemma3 import fix_rope, gguf_rope_scaling
+
+    if fix_rope(model.config, gguf_rope_scaling(gguf_path)):
+        log("Restored the GGUF's linear RoPE scaling, which the conversion drops for Gemma 3.")
     tmp = out.with_name(out.name + ".partial")
     shutil.rmtree(tmp, ignore_errors=True)
     model.save_pretrained(tmp)

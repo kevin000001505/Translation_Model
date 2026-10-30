@@ -20,6 +20,7 @@ class TrainConfig:
     trust_remote_code: bool = False
     gguf_file: str = ""  # train from this GGUF file in model_id (converted to bf16 first)
     gguf_export: str = ""  # also export the fine-tuned model as GGUF: "", Q4_K_M, Q8_0, F16 or BF16
+    publish: bool = False  # upload the GGUF to a private HF repo and deploy it with llm-model-manager
     epochs: float = 1
     max_pairs: int = 0  # 0 = all
     learning_rate: float = 2e-4

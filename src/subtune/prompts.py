@@ -75,6 +75,10 @@ def build_texts(tokenizer, family: str, src_lang: str, tgt_lang: str, src: str, 
         completion = "" if tgt is None else (" " if family == "plain" else "") + tgt + (tokenizer.eos_token or "")
         return prompt, completion
     messages = _messages(family, src_lang, tgt_lang, src)
+    if family == "translategemma" and "<<<source>>>" in (getattr(tokenizer, "chat_template", None) or ""):
+        # vLLM-style TranslateGemma copies take the codes inside a plain string; same rendered prompt.
+        messages = [{"role": "user",
+                     "content": f"<<<source>>>{iso_code(src_lang)}<<<target>>>{iso_code(tgt_lang)}<<<text>>>{src}"}]
     prompt = _template(tokenizer, messages, add_generation_prompt=True)
     if tgt is None:
         return prompt, ""
@@ -103,3 +107,34 @@ def encode(tokenizer, family: str, src_lang: str, tgt_lang: str, src: str,
     p_ids = tokenizer(prompt, add_special_tokens=raw)["input_ids"]
     c_ids = tokenizer(completion, add_special_tokens=False)["input_ids"] if completion else []
     return p_ids, c_ids
+
+
+_PLACEHOLDER = "\ue000SUBTUNE_SOURCE_TEXT\ue000"
+
+
+def plain_text_template(tokenizer, family: str, src_lang: str, tgt_lang: str) -> str:
+    """A Jinja chat template for the exported model: the last user message is the text to
+    translate, wrapped in exactly the prompt the model was fine-tuned with. Callers can then use a
+    plain OpenAI-style request ({"role": "user", "content": "Where are you going?"})."""
+    prompt, _ = build_texts(tokenizer, family, src_lang, tgt_lang, _PLACEHOLDER)
+    head, tail = prompt.split(_PLACEHOLDER)
+    bos = ""
+    if tokenizer.bos_token and head.startswith(tokenizer.bos_token):
+        head, bos = head[len(tokenizer.bos_token):], "{{ bos_token }}"  # let the runtime place BOS
+    for part in (head, tail):
+        if any(t in part for t in ("{{", "{%", "{#")):
+            raise ValueError("prompt text contains Jinja syntax; cannot build a plain-text template")
+    # Literal prompt text is kept outside tags (no escaping needed); no "-" trims touch it.
+    return (
+        '{%- set ns = namespace(text="") -%}'
+        "{%- for message in messages -%}"
+        '{%- if message["role"] == "user" -%}'
+        '{%- if message["content"] is string -%}{%- set ns.text = message["content"] -%}'
+        '{%- else -%}{%- set ns.text = message["content"][0]["text"] -%}{%- endif -%}'
+        "{%- endif -%}"
+        "{%- endfor %}"
+        f"{bos}{head}{{{{ ns.text | trim }}}}{tail}"
+        # Jinja drops a single trailing newline of the template source; end on an expression so
+        # the generation prompt keeps its final "\n".
+        "{{ '' }}"
+    )

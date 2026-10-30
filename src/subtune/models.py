@@ -28,9 +28,18 @@ class ModelSpec:
 
 
 _GEMMA_NOTE = ("Ungated GGUF copy by mradermacher; Google's original repo is gated. The Gemma Terms of Use "
-               "still apply to the fine-tuned model. Converting the GGUF needs about {ram} GB of RAM once.")
+               "still apply to the fine-tuned model. Converting the GGUF needs about {ram} GB of RAM once; "
+               "the non-GGUF TranslateGemma entry is the same model without that step.")
+_GEMMA_ST_NOTE = ("Original bf16 weights (ungated copy by Infomaniak-AI; Google's own repo is gated). "
+                  "The Gemma Terms of Use apply to the fine-tuned model.")
 
 MODELS: list[ModelSpec] = [
+    ModelSpec("Infomaniak-AI/vllm-translategemma-4b-it", "TranslateGemma 4B", "translategemma", 4.3,
+              note=_GEMMA_ST_NOTE),
+    ModelSpec("Infomaniak-AI/vllm-translategemma-12b-it", "TranslateGemma 12B", "translategemma", 12.2,
+              note=_GEMMA_ST_NOTE),
+    ModelSpec("Infomaniak-AI/vllm-translategemma-27b-it", "TranslateGemma 27B", "translategemma", 27.4,
+              note=_GEMMA_ST_NOTE),
     ModelSpec("mradermacher/translategemma-4b-it-GGUF", "TranslateGemma 4B (GGUF f16)", "translategemma", 3.9,
               gguf_file="translategemma-4b-it.f16.gguf", note=_GEMMA_NOTE.format(ram=16)),
     ModelSpec("mradermacher/translategemma-12b-it-GGUF", "TranslateGemma 12B (GGUF Q8_0)", "translategemma", 11.8,

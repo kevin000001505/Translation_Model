@@ -257,9 +257,18 @@ def _check_qlora_local() -> tuple[bool, str]:
     return _qlora_local
 
 
+def publish_status() -> str:
+    from .publish import missing_settings, settings
+
+    missing = missing_settings()
+    if missing:
+        return "Needs in `.env`: " + ", ".join(missing) + "."
+    return f"Deploys to llm-model-manager at {settings()['manager_url']}."
+
+
 def _build_config(src, tgt, selected, members, model_label, custom_id, gguf_file, method, target, gpu, max_hours,
-                  epochs, max_pairs, gguf_export, lr, lora_r, lora_alpha, batch_size, grad_accum, max_seq_len,
-                  eval_sentences) -> TrainConfig:
+                  epochs, max_pairs, gguf_export, publish, lr, lora_r, lora_alpha, batch_size, grad_accum,
+                  max_seq_len, eval_sentences) -> TrainConfig:
     spec = _spec(model_label, custom_id, gguf_file)
     return TrainConfig(
         model_id=spec.model_id, family=spec.family, gguf_file=spec.gguf_file, src=src, tgt=tgt, method=method,
@@ -269,6 +278,7 @@ def _build_config(src, tgt, selected, members, model_label, custom_id, gguf_file
         lora_alpha=int(lora_alpha), batch_size=int(batch_size), grad_accum=int(grad_accum),
         max_seq_len=int(max_seq_len), eval_sentences=int(eval_sentences),
         gguf_export="" if gguf_export == NO_EXPORT else gguf_export,
+        publish=bool(publish),
         titles={k: members.get(k, []) for k in selected},
     )
 
@@ -293,6 +303,14 @@ def start_training(*inputs):
     if target == models.TARGETS[1] and not modal_configured():
         return ("Set MODAL_TOKEN_ID and MODAL_TOKEN_SECRET in .env first.", *no_choice)
     cfg = _build_config(*inputs)
+    if cfg.publish:
+        from .publish import missing_settings
+
+        if not cfg.gguf_export:
+            return ("Uploading needs a GGUF: pick an export type, or untick the upload box.", *no_choice)
+        if missing_settings():
+            return ("To upload and deploy, set " + ", ".join(missing_settings()) + " in .env (or untick the box).",
+                    *no_choice)
     if cfg.method == "Full" and cfg.gguf_file and cfg.gguf_export:
         return ("GGUF export of a *full* fine-tune of a GGUF base model is not supported (its tokenizer would "
                 "have to be rebuilt). Use LoRA or QLoRA, or choose 'No GGUF export'.", *no_choice)
@@ -362,11 +380,65 @@ def refresh_models():
     return df, gr.update(choices=tags, value=tags[0] if tags else None)
 
 
+SENTENCE_COLUMNS = ["Source", "Reference", "Base model", "Fine-tuned", "chrF base", "chrF tuned", "Δ chrF"]
+
+
+def validation_view(tag: str):
+    """Summary, loss curves, base-vs-tuned scores and per-sentence results for one tagged model."""
+    empty = (pd.DataFrame(columns=["step", "loss", "series"]), pd.DataFrame(columns=["bar", "score", "model"]),
+             pd.DataFrame(columns=SENTENCE_COLUMNS))
+    if not tag:
+        return ("", *empty)
+    folder = get_paths().models / tag
+    meta = json.loads((folder / "metadata.json").read_text(encoding="utf-8")) \
+        if (folder / "metadata.json").exists() else {}
+    if not meta:
+        return ("No metadata for this tag.", *empty)
+    v = meta.get("validation") or {}
+    scores = meta.get("scores") or {}
+    base, tuned = scores.get("base") or {}, scores.get("fine_tuned") or {}
+
+    lines = [f"### {tag}"]
+    if base and tuned:
+        lines.append(f"**chrF** {base.get('chrf')} → {tuned.get('chrf')} ({tuned.get('chrf', 0) - base.get('chrf', 0):+.2f})"
+                     f" · **BLEU** {base.get('bleu')} → {tuned.get('bleu')} ({tuned.get('bleu', 0) - base.get('bleu', 0):+.2f})"
+                     f" on {tuned.get('n')} held-out sentences")
+    if v.get("loss_before") is not None:
+        lines.append(f"**Validation loss** {v['loss_before']:.4f} → {v['loss_after']:.4f}")
+    if v.get("sentences"):
+        lines.append(f"**Per sentence:** {v['improved']} better, {v['worse']} worse, "
+                     f"{v['sentences'] - v['changed']} unchanged of {v['sentences']}")
+        if v.get("changed") == 0:
+            lines.append("⚠️ The fine-tuned model translated every validation sentence exactly like the base "
+                         "model: this fine-tune had no effect.")
+    elif not v:
+        lines.append("This model was trained before validation reports existed; only the scores are available.")
+
+    curves = meta.get("curves") or {}
+    loss_rows = [{"step": s_, "loss": l_, "series": name}
+                 for key, name in (("train", "training"), ("validation", "validation"))
+                 for s_, l_ in curves.get(key, [])]
+    loss_df = pd.DataFrame(loss_rows, columns=["step", "loss", "series"])
+    score_rows = [{"bar": f"{name} · {label}", "score": d.get(m), "model": label}
+                  for m, name in (("chrf", "chrF"), ("bleu", "BLEU"))
+                  for label, d in (("base", base), ("fine-tuned", tuned)) if d.get(m) is not None]
+    score_df = pd.DataFrame(score_rows, columns=["bar", "score", "model"])
+
+    sentences = pd.DataFrame(columns=SENTENCE_COLUMNS)
+    path = folder / "validation.jsonl"
+    if path.exists():
+        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        sentences = pd.DataFrame([[r["src"], r["ref"], r["base"], r["tuned"], r["base_chrf"], r["tuned_chrf"], r["delta"]]
+                                  for r in rows], columns=SENTENCE_COLUMNS).sort_values("Δ chrF", ascending=False)
+    return "\n\n".join(lines), loss_df, score_df, sentences
+
+
 def show_model(tag: str):
     if not tag:
-        return {}
+        return ({}, *validation_view(""))
     path = get_paths().models / tag / "metadata.json"
-    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    meta = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    return (meta, *validation_view(tag))
 
 
 # --- layout ---------------------------------------------------------------------------------
@@ -439,6 +511,10 @@ def build_ui() -> gr.Blocks:
                 max_pairs = gr.Number(value=0, label="Max training pairs (0 = all)", minimum=0, precision=0)
                 gguf_export = gr.Dropdown([NO_EXPORT, *EXPORT_CHOICES], value="Q4_K_M",
                                           label="Also export as GGUF (llama.cpp / Ollama / LM Studio)")
+            with gr.Row():
+                publish_cb = gr.Checkbox(value=False, label="Upload the GGUF to my Hugging Face (private repo) and "
+                                                            "deploy it with llm-model-manager")
+                publish_md = gr.Markdown(publish_status())
             with gr.Accordion("Advanced", open=False):
                 with gr.Row():
                     lr = gr.Number(value=d["learning_rate"], label="Learning rate")
@@ -466,7 +542,16 @@ def build_ui() -> gr.Blocks:
             models_btn = gr.Button("Refresh")
             models_df = gr.Dataframe(interactive=False, label="Fine-tuned models (by tag)")
             model_pick = gr.Dropdown([], label="Details for tag")
-            model_json = gr.JSON()
+            val_md = gr.Markdown()
+            with gr.Row():
+                loss_plot = gr.LinePlot(x="step", y="loss", color="series", title="Loss (validation = held-out titles)",
+                                        x_title="training step", y_title="loss", height=300)
+                score_plot = gr.BarPlot(x="bar", y="score", color="model", title="Validation scores",
+                                        x_title="", y_title="score", height=300)
+            sentence_df = gr.Dataframe(interactive=False, wrap=True, max_height=420,
+                                       label="Validation sentences, most improved first")
+            with gr.Accordion("metadata.json", open=False):
+                model_json = gr.JSON()
 
         # --- wiring ---
         listing_outputs = [st_df, st_members, listing_md]
@@ -502,8 +587,8 @@ def build_ui() -> gr.Blocks:
         gguf_dd.input(estimate_text, model_inputs, estimate_md)
 
         train_inputs = [src, tgt, st_selected, st_members, model_dd, custom_id, gguf_dd, method, target, gpu, max_hours,
-                        epochs, max_pairs, gguf_export, lr, lora_r, lora_alpha, batch_size, grad_accum, max_seq_len,
-                        eval_sentences]
+                        epochs, max_pairs, gguf_export, publish_cb, lr, lora_r, lora_alpha, batch_size, grad_accum,
+                        max_seq_len, eval_sentences]
         start_btn.click(start_training, train_inputs,
                         [train_msg, choice_box, choice_md, train_now_btn, dl_only_btn, dl_train_btn])
         train_now_btn.click(train_ready_now, train_inputs, [train_msg, choice_box])
@@ -518,7 +603,7 @@ def build_ui() -> gr.Blocks:
 
         demo.load(refresh_models, None, [models_df, model_pick])
         models_btn.click(refresh_models, None, [models_df, model_pick])
-        model_pick.change(show_model, model_pick, model_json)
+        model_pick.change(show_model, model_pick, [model_json, val_md, loss_plot, score_plot, sentence_df])
     return demo
 
 
