@@ -17,6 +17,7 @@ from typing import Callable
 import torch
 
 from .evaluate import score
+from .progress import heartbeat
 from .prompts import encode, end_marker, resolve_family
 from .runconfig import TrainConfig
 
@@ -63,7 +64,8 @@ def load_model(cfg: TrainConfig, log: Log):
             load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
             bnb_4bit_compute_dtype=torch.bfloat16,
         )
-    model = AutoModelForCausalLM.from_pretrained(source, **kwargs)
+    with heartbeat(log, f"loading {cfg.model_id} onto the {'GPU' if torch.cuda.is_available() else 'CPU'}"):
+        model = AutoModelForCausalLM.from_pretrained(source, **kwargs)
     if tokenizer.eos_token is None:
         # Some tokenizers (e.g. Seed-X) only declare EOS in the model config; without it the model
         # would never learn where a translation ends.
@@ -180,10 +182,14 @@ def run_training(cfg: TrainConfig, run_dir: Path, out_dir: Path, log: Log = prin
     log(f"Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}; "
         f"{len(train_rows)} training pairs, {len(eval_rows)} evaluation sentences.")
 
+    steps = 5 if cfg.gguf_export else 4
+    log(f"Step 1/{steps}: preparing the base model.")
     model, tokenizer, source = load_model(cfg, log)
     family = resolve_family(cfg.family, tokenizer)
 
-    base_scores = evaluate_model(model, tokenizer, family, cfg, eval_rows, log, "Base model")
+    log(f"Step 2/{steps}: scoring the base model on {len(eval_rows)} held-out sentences.")
+    with heartbeat(log, "scoring the base model"):
+        base_scores = evaluate_model(model, tokenizer, family, cfg, eval_rows, log, "Base model")
 
     if cfg.method in ("LoRA", "QLoRA"):
         model = add_adapters(model, cfg, log)
@@ -226,18 +232,22 @@ def run_training(cfg: TrainConfig, run_dir: Path, out_dir: Path, log: Log = prin
     trainer = Trainer(model=model, args=args, train_dataset=data,
                       data_collator=_collate(tokenizer.pad_token_id),
                       callbacks=[_LogCallback()])
+    log(f"Step 3/{steps}: training ({math.ceil(total_steps)} steps; progress is logged every few steps).")
     t0 = time.time()
     result = trainer.train()
     train_seconds = time.time() - t0
     log(f"Training finished in {train_seconds / 60:.1f} min, final loss {result.training_loss:.4f}.")
 
     model.config.use_cache = True
-    tuned_scores = evaluate_model(model, tokenizer, family, cfg, eval_rows, log, "Fine-tuned model")
+    log(f"Step 4/{steps}: scoring the fine-tuned model and saving it.")
+    with heartbeat(log, "scoring the fine-tuned model"):
+        tuned_scores = evaluate_model(model, tokenizer, family, cfg, eval_rows, log, "Fine-tuned model")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     weights_dir = out_dir / ("adapter" if cfg.method != "Full" else "model")
-    model.save_pretrained(weights_dir)
-    tokenizer.save_pretrained(weights_dir)
+    with heartbeat(log, "saving the weights"):
+        model.save_pretrained(weights_dir)
+        tokenizer.save_pretrained(weights_dir)
     log(f"Saved weights to {weights_dir}")
     metrics = {
         "base": base_scores,
@@ -261,8 +271,10 @@ def run_training(cfg: TrainConfig, run_dir: Path, out_dir: Path, log: Log = prin
 
                 token = os.environ.get("HF_TOKEN") or None
                 base_gguf = Path(hf_hub_download(cfg.model_id, cfg.gguf_file, token=token))
-            path = export_gguf(cfg.gguf_export, source, weights_dir, cfg.method != "Full", out_dir,
-                               run_dir / "gguf-work", cfg.trust_remote_code, log, base_gguf=base_gguf)
+            log(f"Step 5/{steps}: exporting a {cfg.gguf_export} GGUF.")
+            with heartbeat(log, "exporting the GGUF"):
+                path = export_gguf(cfg.gguf_export, source, weights_dir, cfg.method != "Full", out_dir,
+                                   run_dir / "gguf-work", cfg.trust_remote_code, log, base_gguf=base_gguf)
             metrics["gguf"] = {"type": cfg.gguf_export, "file": str(path.relative_to(out_dir))}
         except Exception as exc:  # the fine-tune itself is fine; report the export problem and keep it
             log(f"GGUF export failed: {exc}")
